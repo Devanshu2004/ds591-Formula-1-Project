@@ -1,1 +1,13 @@
+# Secrets and Config
+local.settings.json
+.env
+
+# Environments and Caches
+.venv/
 venv/
+__pycache__/
+f1_cache/
+
+# OS/IDE files
+.DS_Store
+.vscode/
