@@ -1,2 +1,7 @@
 numpy
 pandas
+fastf1
+pyarrow
+requests
+matplotlib
+scipy
