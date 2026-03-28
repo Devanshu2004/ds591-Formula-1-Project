@@ -185,7 +185,6 @@ def run_bronze_pipeline(year: int, location: str, session_type: str):
 
         logging.info("Bronze pipeline completed successfully")
 
-
     except Exception as e:
         logging.error(f"Pipeline failed: {e}")
         raise
