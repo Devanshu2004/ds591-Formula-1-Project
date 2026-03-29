@@ -7,9 +7,13 @@ local.settings.json
 venv/
 __pycache__/
 f1_cache/
+cache/
 
 # OS/IDE files
 .DS_Store
 .vscode/
 *.csv
 *.json
+
+.python_packages
+
