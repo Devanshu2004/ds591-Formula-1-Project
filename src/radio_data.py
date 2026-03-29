@@ -17,6 +17,8 @@ Architecture (live):
                                                         → Stream Analytics → Power BI
 
 Environment variables (loaded from local.settings.json or Azure App Settings):
+    F1_STORAGE_CONNECTION_STRING - ADLS Gen2 connection string (batch → bronze)
+    ADLS_CONTAINER_NAME          - ADLS container name (default: "bronze")
     EVENT_HUB_CONNECTION_STRING  - Azure Event Hub connection string
     EVENT_HUB_NAME               - Event Hub instance name
     AZURE_SPEECH_KEY             - Azure Speech Services subscription key
@@ -65,6 +67,8 @@ EVENT_HUB_CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
 EVENT_HUB_NAME = os.environ.get("EVENT_HUB_NAME", "")
 AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "")
+ADLS_CONNECTION_STR = os.environ.get("F1_STORAGE_CONNECTION_STRING", "")
+ADLS_CONTAINER_NAME = os.environ.get("ADLS_CONTAINER_NAME", "bronze")
 
 # ---------------------------------------------------------------------------
 # Keyword patterns for classification
@@ -395,6 +399,51 @@ def save_results(events, output_dir):
     return json_path, csv_path
 
 
+def upload_to_adls_bronze(events, session_key=None, race_name=None):
+    """Upload classified radio events to ADLS Gen2 bronze/radio/ as parquet."""
+    if not ADLS_CONNECTION_STR:
+        log.warning("F1_STORAGE_CONNECTION_STRING not set — skipping ADLS upload.")
+        return None
+
+    from azure.storage.filedatalake import DataLakeServiceClient
+    import io
+
+    try:
+        service_client = DataLakeServiceClient.from_connection_string(ADLS_CONNECTION_STR)
+        fs_client = service_client.get_file_system_client(ADLS_CONTAINER_NAME)
+
+        # Build path: bronze/radio/{race_name}-{session_key}/team_radio_events.parquet
+        if race_name and session_key:
+            folder_name = f"{race_name}-{session_key}".replace(" ", "_")
+        elif session_key:
+            folder_name = str(session_key)
+        else:
+            folder_name = "all_sessions"
+        folder = f"radio/{folder_name}"
+
+        # Create directory if it doesn't exist
+        dir_client = fs_client.get_directory_client(folder)
+        dir_client.create_directory()
+
+        # Convert events to parquet bytes
+        df = pd.json_normalize(events)
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, index=False)
+        parquet_bytes = buffer.getvalue()
+
+        # Upload parquet file
+        file_client = dir_client.get_file_client("team_radio_events.parquet")
+        file_client.upload_data(parquet_bytes, overwrite=True)
+
+        adls_path = f"{ADLS_CONTAINER_NAME}/{folder}/team_radio_events.parquet"
+        log.info("Uploaded %d events to ADLS: %s", len(events), adls_path)
+        return adls_path
+
+    except Exception as e:
+        log.error("ADLS upload failed: %s", e)
+        return None
+
+
 def print_summary(events):
     df = pd.json_normalize(events)
     log.info("--- Summary ---")
@@ -433,6 +482,15 @@ def run_batch(session_key=None, output_dir=None, whisper_model="base"):
         return []
 
     save_results(events, output_dir)
+
+    # Look up race name from sessions for ADLS folder naming
+    race_name = None
+    if session_key is not None:
+        match = sessions[sessions["session_key"] == session_key]
+        if not match.empty:
+            race_name = match.iloc[0].get("location", None)
+
+    upload_to_adls_bronze(events, session_key=session_key, race_name=race_name)
     print_summary(events)
     return events
 

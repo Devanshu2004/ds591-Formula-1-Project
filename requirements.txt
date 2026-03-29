@@ -6,4 +6,5 @@ requests
 matplotlib
 scipy
 azure-eventhub
+azure-functions
 certifi
