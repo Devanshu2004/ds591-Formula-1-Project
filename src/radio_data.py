@@ -1,12 +1,32 @@
 """
-F1 Team Radio Pipeline
-Fetches, transcribes, and classifies team radio communications from OpenF1 API.
-Outputs structured JSON and CSV for Azure ingestion.
+F1 Team Radio Pipeline — Batch & Live Modes
+
+Two operating modes:
+
+  BATCH MODE (default):
+    Fetches historical team radio from OpenF1, transcribes with Whisper locally,
+    classifies, and saves to JSON/CSV.
+
+  LIVE MODE (--live):
+    Polls OpenF1 API for new radio recordings during a live session,
+    transcribes with Azure Speech Services (real-time, low latency),
+    classifies, and pushes events to Azure Event Hub.
+
+Architecture (live):
+  OpenF1 API (poll) → Azure Speech Services → Classify → Azure Event Hub
+                                                        → Stream Analytics → Power BI
+
+Environment variables (loaded from local.settings.json or Azure App Settings):
+    EVENT_HUB_CONNECTION_STRING  - Azure Event Hub connection string
+    EVENT_HUB_NAME               - Event Hub instance name
+    AZURE_SPEECH_KEY             - Azure Speech Services subscription key
+    AZURE_SPEECH_REGION          - Azure Speech Services region (e.g. "eastus")
 
 Usage:
-    python radio_data.py                        # Process all race sessions
-    python radio_data.py --session-key 9158     # Process a specific session
-    python radio_data.py --output-dir /path     # Custom output directory
+    python radio_data.py                                # Batch: all race sessions
+    python radio_data.py --session-key 9158             # Batch: specific session
+    python radio_data.py --live --session-key 9158      # Live: poll a live session
+    python radio_data.py --live --poll-interval 10      # Live: custom poll interval
 """
 
 import argparse
@@ -15,11 +35,10 @@ import logging
 import os
 import re
 import tempfile
+import time
 
 import pandas as pd
 import requests
-import torch
-import whisper
 
 BASE_URL = "https://api.openf1.org/v1"
 REQUEST_TIMEOUT = 60
@@ -30,6 +49,22 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# ==============================
+# CONFIGURATION — load local.settings.json, then read env vars
+# ==============================
+_settings_path = os.path.join(os.path.dirname(__file__), "..", "local.settings.json")
+if os.path.exists(_settings_path):
+    with open(_settings_path) as _f:
+        _settings = json.load(_f)
+    for _key, _val in _settings.get("Values", {}).items():
+        os.environ.setdefault(_key, str(_val))
+    log.info("Loaded settings from local.settings.json")
+
+EVENT_HUB_CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
+EVENT_HUB_NAME = os.environ.get("EVENT_HUB_NAME", "")
+AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "")
 
 # ---------------------------------------------------------------------------
 # Keyword patterns for classification
@@ -287,17 +322,19 @@ def classify_radio(transcript, record):
     }
 
 
-# ---------------------------------------------------------------------------
-# Transcription & processing
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# BATCH MODE — Whisper (local transcription)
+# ===========================================================================
 def load_whisper_model(model_size="base"):
+    import torch
+    import whisper
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info("Loading Whisper '%s' model on %s...", model_size, device)
     model = whisper.load_model(model_size, device=device)
     return model
 
 
-def transcribe_and_classify(radio_df, model):
+def transcribe_and_classify_batch(radio_df, model):
     events = []
     failed = 0
     total = len(radio_df)
@@ -305,7 +342,6 @@ def transcribe_and_classify(radio_df, model):
     for idx, (_, row) in enumerate(radio_df.iterrows()):
         url = row["recording_url"]
 
-        # Download audio
         try:
             r = requests.get(url, timeout=30)
             r.raise_for_status()
@@ -314,7 +350,6 @@ def transcribe_and_classify(radio_df, model):
             failed += 1
             continue
 
-        # Write to temp file and transcribe
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             f.write(r.content)
             tmppath = f.name
@@ -344,9 +379,6 @@ def transcribe_and_classify(radio_df, model):
     return events
 
 
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
 def save_results(events, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -375,14 +407,14 @@ def print_summary(events):
         log.info("  Strategy signal %-20s %5d occurrences", label, df[col].sum())
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def run(session_key=None, output_dir=None, whisper_model="base"):
+def run_batch(session_key=None, output_dir=None, whisper_model="base"):
+    log.info("=" * 60)
+    log.info("F1 Team Radio Pipeline — BATCH MODE (Whisper)")
+    log.info("=" * 60)
+
     if output_dir is None:
         output_dir = os.path.join(os.path.dirname(__file__), "..", "data")
 
-    # Fetch data
     sessions = fetch_sessions()
     radio = fetch_team_radio(session_key=session_key)
 
@@ -393,34 +425,196 @@ def run(session_key=None, output_dir=None, whisper_model="base"):
         log.warning("No radio recordings found. Exiting.")
         return []
 
-    # Transcribe and classify
     model = load_whisper_model(whisper_model)
-    events = transcribe_and_classify(radio, model)
+    events = transcribe_and_classify_batch(radio, model)
 
     if not events:
         log.warning("No events produced. Exiting.")
         return []
 
-    # Save outputs
     save_results(events, output_dir)
     print_summary(events)
-
     return events
 
 
+# ===========================================================================
+# LIVE MODE — Azure Speech Services + Event Hub
+# ===========================================================================
+def transcribe_with_azure_speech(audio_content):
+    """Transcribe audio bytes using Azure Speech Services REST API."""
+    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+        log.error("AZURE_SPEECH_KEY or AZURE_SPEECH_REGION not set.")
+        return None
+
+    endpoint = (
+        f"https://{AZURE_SPEECH_REGION}.stt.speech.microsoft.com"
+        f"/speech/recognition/conversation/cognitiveservices/v1"
+        f"?language=en-US"
+    )
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+        "Content-Type": "audio/mpeg",
+        "Accept": "application/json",
+    }
+
+    try:
+        resp = requests.post(endpoint, headers=headers, data=audio_content, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+
+        if result.get("RecognitionStatus") == "Success":
+            return result.get("DisplayText", "").strip()
+        else:
+            log.debug("Azure Speech status: %s", result.get("RecognitionStatus"))
+            return None
+    except Exception as e:
+        log.error("Azure Speech transcription failed: %s", e)
+        return None
+
+
+def push_to_event_hub(data, label="radio"):
+    """Push a list of records to Azure Event Hub as JSON EventData messages."""
+    if not data:
+        return
+
+    if not EVENT_HUB_CONNECTION_STR or not EVENT_HUB_NAME:
+        log.warning("Event Hub not configured — dry-run mode.")
+        log.info("[DRY RUN] Would push %d %s records.", len(data), label)
+        for record in data[:2]:
+            log.debug(json.dumps(record, indent=2, default=str))
+        return
+
+    from azure.eventhub import EventHubProducerClient, EventData
+
+    try:
+        producer = EventHubProducerClient.from_connection_string(
+            conn_str=EVENT_HUB_CONNECTION_STR,
+            eventhub_name=EVENT_HUB_NAME,
+        )
+        with producer:
+            batch = producer.create_batch()
+            for record in data:
+                try:
+                    batch.add(EventData(json.dumps(record, default=str)))
+                except ValueError:
+                    producer.send_batch(batch)
+                    log.info("Batch full — sent intermediate batch.")
+                    batch = producer.create_batch()
+                    batch.add(EventData(json.dumps(record, default=str)))
+            producer.send_batch(batch)
+
+        log.info("Pushed %d %s records to Azure Event Hub.", len(data), label)
+
+    except Exception as e:
+        log.error("Event Hub push failed: %s", e, exc_info=True)
+
+
+def run_live(session_key, poll_interval=10):
+    """
+    Live mode: poll OpenF1 for new radio recordings, transcribe with Azure Speech
+    Services, classify, and push to Event Hub in near-real-time.
+    """
+    log.info("=" * 60)
+    log.info("F1 Team Radio Pipeline — LIVE MODE (Azure Speech Services)")
+    log.info("  Session key : %s", session_key)
+    log.info("  Poll interval: %ds", poll_interval)
+    log.info("  Event Hub    : %s", "configured" if EVENT_HUB_CONNECTION_STR else "NOT SET (dry-run)")
+    log.info("  Speech Svc   : %s", "configured" if AZURE_SPEECH_KEY else "NOT SET")
+    log.info("=" * 60)
+
+    if not AZURE_SPEECH_KEY:
+        log.error("AZURE_SPEECH_KEY is required for live mode. Exiting.")
+        return
+
+    seen_urls = set()
+    total_pushed = 0
+
+    log.info("Starting live polling loop. Press Ctrl+C to stop.")
+
+    try:
+        while True:
+            try:
+                radio = fetch_team_radio(session_key=session_key)
+            except Exception as e:
+                log.error("Failed to fetch radio data: %s", e)
+                time.sleep(poll_interval)
+                continue
+
+            if radio.empty:
+                log.info("No radio data yet. Waiting...")
+                time.sleep(poll_interval)
+                continue
+
+            # Filter to only new recordings
+            new_rows = radio[~radio["recording_url"].isin(seen_urls)]
+            if new_rows.empty:
+                log.info("No new recordings. (%d total seen)", len(seen_urls))
+                time.sleep(poll_interval)
+                continue
+
+            log.info("Found %d new recordings to process.", len(new_rows))
+            events = []
+
+            for _, row in new_rows.iterrows():
+                url = row["recording_url"]
+                seen_urls.add(url)
+
+                # Download audio
+                try:
+                    r = requests.get(url, timeout=30)
+                    r.raise_for_status()
+                except Exception as e:
+                    log.debug("Download failed for %s: %s", url, e)
+                    continue
+
+                # Transcribe with Azure Speech Services
+                transcript = transcribe_with_azure_speech(r.content)
+                if not transcript:
+                    continue
+
+                # Classify
+                event = classify_radio(transcript, row.to_dict())
+                events.append(event)
+                log.info("  Driver %s | %s | %s",
+                         event.get("driver_number"), event["primary_event_type"],
+                         transcript[:60])
+
+            if events:
+                push_to_event_hub(events, label="live-radio")
+                total_pushed += len(events)
+                log.info("Total events pushed this session: %d", total_pushed)
+
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        log.info("Live polling stopped by user. Total events pushed: %d", total_pushed)
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
 def main():
     parser = argparse.ArgumentParser(description="F1 Team Radio Pipeline")
+    parser.add_argument("--live", action="store_true",
+                        help="Run in live mode (Azure Speech + Event Hub)")
     parser.add_argument("--session-key", type=int, default=None,
-                        help="Process a specific session key (default: all race sessions)")
+                        help="Process a specific session key (required for live mode)")
     parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output directory (default: team_radio/data/)")
+                        help="Output directory for batch mode (default: data/)")
     parser.add_argument("--whisper-model", type=str, default="base",
                         choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model size (default: base)")
+                        help="Whisper model size for batch mode (default: base)")
+    parser.add_argument("--poll-interval", type=int, default=10,
+                        help="Seconds between polls in live mode (default: 10)")
     args = parser.parse_args()
 
-    run(session_key=args.session_key, output_dir=args.output_dir,
-        whisper_model=args.whisper_model)
+    if args.live:
+        if not args.session_key:
+            parser.error("--session-key is required for live mode")
+        run_live(session_key=args.session_key, poll_interval=args.poll_interval)
+    else:
+        run_batch(session_key=args.session_key, output_dir=args.output_dir,
+                  whisper_model=args.whisper_model)
 
 
 if __name__ == "__main__":

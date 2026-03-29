@@ -5,3 +5,5 @@ pyarrow
 requests
 matplotlib
 scipy
+azure-eventhub
+certifi
