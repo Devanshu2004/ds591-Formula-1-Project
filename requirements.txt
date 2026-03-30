@@ -3,5 +3,5 @@ pandas
 fastf1
 pyarrow
 requests
-matplotlib
-scipy
+fsspec
+adlfs

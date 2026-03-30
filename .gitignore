@@ -12,9 +12,9 @@ venv/
 __pycache__/
 f1_cache/
 cache/
+.vscode 
 
 # OS/IDE files
 .DS_Store
-.vscode/
 
 .python_packages

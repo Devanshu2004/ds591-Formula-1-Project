@@ -1,1 +1,28 @@
+
+# Python
 .venv
+__pycache__
+*.pyc
+
+# Git / IDE
+.git
+.vscode
+.DS_Store
+
+# Data files — never deploy these
+data/
+data/f1_cache/
+archive/
+*.parquet
+*.ff1pkl
+*.ipynb
+*.log
+
+# Secrets
+local.settings.json
+
+# Src files not needed at runtime
+src/live_casting.ipynb
+src/live_timing_data.txt
+src/f1_pipeline.log
+src/emergency_push.py
