@@ -2,6 +2,10 @@
 local.settings.json
 .env
 
+data/
+
+archive/
+
 # Environments and Caches
 .venv/
 venv/

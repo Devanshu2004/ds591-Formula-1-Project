@@ -8,3 +8,5 @@ scipy
 azure-eventhub
 azure-functions
 certifi
+fsspec
+adlfs
