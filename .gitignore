@@ -16,5 +16,11 @@ cache/
 # OS/IDE files
 .DS_Store
 .vscode/
+*.csv
+*.json
+*.log
+
+team_radio/
 
 .python_packages
+
