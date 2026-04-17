@@ -30,6 +30,7 @@ import logging
 import json
 import os
 from src.live_casting import main as live_casting_main
+from src.social_media_analysis import run_social_processor
 
 app = func.FunctionApp()
 
@@ -250,3 +251,37 @@ def run_gold(req: func.HttpRequest) -> func.HttpResponse:
             "status": "error",
             "message": str(e)
         }, 500)
+
+# ── SOCIAL MEDIA ANALYSIS ──────────────────────────────────────────────────────
+@app.route(route="process_social", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def run_social_media_pipeline(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP Trigger to run the Social Media Analysis.
+    Moves data from social_media_bronze.json -> social_media_analysis.parquet
+    """
+    logging.info("Social Media Analysis pipeline triggered via HTTP.")
+
+    try:
+        # Calls the script that handles mapping, life scores, and parquet export
+        final_scores = run_social_processor()
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "message": "Social media silver pipeline completed",
+                "life_scores": final_scores
+            }),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.exception(f"Social Media Pipeline failed: {e}")
+        return func.HttpResponse(
+            json.dumps({
+                "status": "error",
+                "message": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
