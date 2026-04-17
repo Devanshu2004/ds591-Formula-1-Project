@@ -1,0 +1,18 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "",
+    "STORAGE_ACCOUNT_NAME": "",
+    "STORAGE_ACCOUNT_KEY": "",
+    "ADLS_CONTAINER": "",
+    "ADLS_DIRECTORY": "",
+    "EVENT_HUB_CONNECTION_STRING": "",
+    "EVENT_HUB_NAME": "",
+    "F1_USERNAME": "",
+    "F1_PASSWORD": "",
+    "F1_YEAR": "2026",
+    "F1_GRAND_PRIX": "Miami",
+    "F1_SESSION_TYPE": "R",
+    "FUNCTIONS_WORKER_RUNTIME": "python"
+  }
+}

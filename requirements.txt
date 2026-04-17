@@ -1,2 +1,13 @@
 numpy
 pandas
+fastf1
+pyarrow
+requests
+matplotlib
+scipy
+azure-eventhub
+azure-functions
+certifi
+fsspec
+adlfs
+textblob
