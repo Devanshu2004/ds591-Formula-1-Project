@@ -77,7 +77,9 @@ EVENT_HUB_CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
 EVENT_HUB_NAME           = os.environ.get("EVENT_HUB_NAME", "")
 
 # FastF1 cache directory
-fastf1.Cache.enable_cache("./cache")
+cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
+os.makedirs(cache_dir, exist_ok=True)
+fastf1.Cache.enable_cache(cache_dir)
 
 # ==============================
 # HELPER — safe value converter
