@@ -10,3 +10,4 @@ azure-functions
 certifi
 fsspec
 adlfs
+textblob
