@@ -263,7 +263,7 @@ def run_social_media_pipeline(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         # Calls the script that handles mapping, life scores, and parquet export
-        final_scores = run_social_silver_processor()
+        final_scores = run_social_processor()
 
         return func.HttpResponse(
             json.dumps({
