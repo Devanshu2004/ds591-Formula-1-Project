@@ -29,8 +29,8 @@ import azure.functions as func
 import logging
 import json
 import os
-from src.live_casting import main as live_casting_main
-from src.social_media_analysis import run_social_processor
+# from src.live_casting import main as live_casting_main
+# from src.social_media_analysis import run_social_processor
 
 app = func.FunctionApp()
 
@@ -38,6 +38,7 @@ app = func.FunctionApp()
 # This decorator defines the Timer Trigger (Running every hour)
 @app.timer_trigger(schedule="*/10 * * * * *", arg_name="mytimer", run_on_startup=False)
 def f1_live_process(mytimer: func.TimerRequest) -> None:
+    from src.live_casting import main as live_casting_main
     if mytimer.past_due:
         logging.info('The timer is past due!')
 
@@ -211,6 +212,11 @@ def run_silver(req: func.HttpRequest) -> func.HttpResponse:
             "message": str(e)
         }, 500)
 
+@app.route(route="health", methods=["GET","POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def health(req: func.HttpRequest) -> func.HttpResponse:
+    import sys
+    pkgs = [m for m in sys.modules.keys()]
+    return func.HttpResponse(f"OK - Python {sys.version}", status_code=200)
 
 # ── HISTORICAL: GOLD ───────────────────────────────────────────────────────────
 @app.route(route="run_gold", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
@@ -255,6 +261,7 @@ def run_gold(req: func.HttpRequest) -> func.HttpResponse:
 # ── SOCIAL MEDIA ANALYSIS ──────────────────────────────────────────────────────
 @app.route(route="process_social", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def run_social_media_pipeline(req: func.HttpRequest) -> func.HttpResponse:
+    from src.social_media_analysis import run_social_processor
     """
     HTTP Trigger to run the Social Media Analysis.
     Moves data from social_media_bronze.json -> social_media_analysis.parquet

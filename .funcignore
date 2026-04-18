@@ -1,1 +1,24 @@
+cat > .funcignore << 'EOF'
 .venv
+__pycache__
+*.pyc
+.git
+cache
+*.ipynb
+*.log
+__azurite_db_*.json
+__blobstorage__
+__queuestorage__
+.vscode
+Dockerfile
+.dockerignore
+local.settings.json
+live_timing_data.txt
+f1_pipeline.log
+src/f1_pipeline.log
+src/live_timing_data.txt
+src/live_casting.ipynb
+src/team_radio.ipynb
+EOF
+src/emergency_push.py
+src/fetch_data.py
