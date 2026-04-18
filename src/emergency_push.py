@@ -8,7 +8,9 @@ from azure.eventhub import EventHubProducerClient, EventData
 import fastf1
 import pandas as pd, numpy as np
 
-fastf1.Cache.enable_cache("./cache")
+_cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
+os.makedirs(_cache_dir, exist_ok=True)
+fastf1.Cache.enable_cache(_cache_dir)
 
 conn = os.environ["EVENT_HUB_CONNECTION_STRING"]
 name = os.environ["EVENT_HUB_NAME"]
