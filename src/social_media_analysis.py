@@ -63,7 +63,7 @@ driver_abb = {
 }
 
 # Reverse lookup: Name -> Abbreviation
-NAME_TO_ABB = {name.lower(): abb for abb, names in DRIVER_ABB.items() for name in names}
+NAME_TO_ABB = {name.lower(): abb for abb, names in driver_abb.items() for name in names}
 
 # --- 2. Cleaning Function ---
 def get_clean_sentiment(text):
