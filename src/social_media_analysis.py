@@ -63,7 +63,7 @@ driver_abb = {
 }
 
 # Reverse lookup: Name -> Abbreviation
-NAME_TO_ABB = {name.lower(): abb for abb, names in driver_abb.items() for name in names}
+NAME_TO_ABB = {name.lower(): abb for abb, names in DRIVER_ABB.items() for name in names}
 
 # --- 2. Cleaning Function ---
 def get_clean_sentiment(text):
@@ -105,65 +105,49 @@ def run_social_processor():
             raw_data = json.load(f)
         
         processed_rows = []
-        # Target years as requested
-        target_years = [2024, 2025, 2026]
-
         for entry in raw_data:
             full_name = entry.get('fullName', 'Unknown')
-            # Convert "Franco Colapinto" to "COL"
             abb = NAME_TO_ABB.get(full_name.lower(), "UNK")
-            
-            if abb == "UNK":
-                continue # Skip drivers not in our official list
+            if abb == "UNK": continue
 
             posts = entry.get('latestPosts', [])
             for post in posts:
                 ts_str = post.get('timestamp')
                 if not ts_str: continue
                 
-                # Extract Year
                 dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-                year = dt.year
                 
-                if year in target_years:
-                    likes = post.get('likesCount', 0)
-                    sentiment = get_clean_sentiment(post.get('caption', ''))
-                    score = calculate_life_score(sentiment, likes)
-                    
-                    processed_rows.append({
-                        "driver_abb": abb,
-                        "year": year,
-                        "sentiment": sentiment,
-                        "life_score": score,
-                        "likes": likes,
-                        "timestamp": ts_str
-                    })
+                processed_rows.append({
+                    "driver_abb": abb,
+                    "year": str(dt.year),
+                    "month": str(dt.month), 
+                    "life_score": calculate_life_score(get_clean_sentiment(post.get('caption', '')), post.get('likesCount', 0))
+                })
 
-        if not processed_rows:
-            logging.warning("Processing yielded no results for 2024-2026.")
-            return
-
-        # 2. Convert to DataFrame
         df_silver = pd.DataFrame(processed_rows)
 
-        # 3. Save to Silver as Parquet (Arranged by Driver and Year)
+        # Save partitioned Parquet to Silver
         output_parquet = _abfs_path(silver_container, "social_media_analysis.parquet")
-        
-        logging.info("Writing Parquet to Silver Container...")
-        # Partitioning creates a directory structure: year=2024/driver_abb=COL/
-        df_silver.to_parquet(
-            output_parquet, 
-            index=False, 
-            storage_options=storage_options,
-            partition_cols=['year', 'driver_abb']
-        )
+        df_silver.to_parquet(output_parquet, index=False, storage_options=storage_options, partition_cols=['year', 'month'])
 
-        # 4. Generate Final Dictionary (Gold Level summary)
-        final_dict = df_silver.groupby('driver_abb')['life_score'].mean().to_dict()
-        final_dict = {k: round(v, 1) for k, v in final_dict.items()}
+        # Build Nested Dictionary Output
+        grouped = df_silver.groupby(['year', 'month', 'driver_abb'])['life_score'].mean().round(1)
         
-        print(f"Pipeline Success. Final Scores: {final_dict}")
-        return final_dict
+        nested_output = {}
+        for (year, month, driver), score in grouped.items():
+            if year not in nested_output:
+                nested_output[year] = {"Month": {}}
+            if month not in nested_output[year]["Month"]:
+                nested_output[year]["Month"][month] = {}
+            
+            nested_output[year]["Month"][month][driver] = score
+
+        final_response = {
+            "Status": "Success",
+            "Year": nested_output
+        }
+
+        return final_response
 
     except Exception as e:
         logging.error(f"Pipeline Error: {e}")
