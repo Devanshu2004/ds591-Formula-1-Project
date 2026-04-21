@@ -1,49 +1,31 @@
 """
-F1 Team Radio Pipeline — Batch & Live Modes
+F1 Team Radio Pipeline — Medallion Architecture (Bronze → Silver)
 
-Two operating modes:
+BRONZE: Fetch raw team radio recordings from OpenF1 API → ADLS bronze/radio_bronze.json
+SILVER: Transcribe (Whisper) + Classify → ADLS silver/radio_silver.parquet
+        Partitioned by year / month / driver_abb
+LIVE:   Poll OpenF1 → Azure Speech → Event Hub (commented out)
 
-  BATCH MODE (default):
-    Fetches historical team radio from OpenF1, transcribes with Whisper locally,
-    classifies, and saves to JSON/CSV.
-
-  LIVE MODE (--live):
-    Polls OpenF1 API for new radio recordings during a live session,
-    transcribes with Azure Speech Services (real-time, low latency),
-    classifies, and pushes events to Azure Event Hub.
-
-Architecture (live):
-  OpenF1 API (poll) → Azure Speech Services → Classify → Azure Event Hub
-                                                        → Stream Analytics → Power BI
-
-Environment variables (loaded from local.settings.json or Azure App Settings):
-    F1_STORAGE_CONNECTION_STRING - ADLS Gen2 connection string (batch → bronze)
-    ADLS_CONTAINER_NAME          - ADLS container name (default: "bronze")
-    EVENT_HUB_CONNECTION_STRING  - Azure Event Hub connection string
-    EVENT_HUB_NAME               - Event Hub instance name
-    AZURE_SPEECH_KEY             - Azure Speech Services subscription key
-    AZURE_SPEECH_REGION          - Azure Speech Services region (e.g. "eastus")
-
-Usage:
-    python radio_data.py                                # Batch: all race sessions
-    python radio_data.py --session-key 9158             # Batch: specific session
-    python radio_data.py --live --session-key 9158      # Live: poll a live session
-    python radio_data.py --live --poll-interval 10      # Live: custom poll interval
+Environment variables:
+    STORAGE_ACCOUNT_NAME         - Azure Storage account name
+    STORAGE_ACCOUNT_KEY          - Azure Storage account key
+    BRONZE_CONTAINER             - Bronze container (default: "bronze")
+    SILVER_CONTAINER             - Silver container (default: "silver")
+    EVENT_HUB_CONNECTION_STRING  - Azure Event Hub connection string  (live only)
+    EVENT_HUB_NAME               - Event Hub instance name            (live only)
+    AZURE_SPEECH_KEY             - Azure Speech Services key          (live only)
+    AZURE_SPEECH_REGION          - Azure Speech Services region       (live only)
 """
 
-import argparse
 import json
 import logging
 import os
 import re
 import tempfile
-import time
 
+import fsspec
 import pandas as pd
 import requests
-
-BASE_URL = "https://api.openf1.org/v1"
-REQUEST_TIMEOUT = 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,50 +34,55 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ==============================
-# CONFIGURATION — load local.settings.json, then read env vars
-# ==============================
-_settings_path = os.path.join(os.path.dirname(__file__), "..", "local.settings.json")
-if os.path.exists(_settings_path):
-    with open(_settings_path) as _f:
-        _settings = json.load(_f)
-    for _key, _val in _settings.get("Values", {}).items():
-        os.environ.setdefault(_key, str(_val))
-    log.info("Loaded settings from local.settings.json")
+BASE_URL = "https://api.openf1.org/v1"
+REQUEST_TIMEOUT = 60
 
-EVENT_HUB_CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
-EVENT_HUB_NAME = os.environ.get("EVENT_HUB_NAME", "")
-AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
-AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "")
-ADLS_CONNECTION_STR = os.environ.get("F1_STORAGE_CONNECTION_STRING", "")
-ADLS_CONTAINER_NAME = os.environ.get("ADLS_CONTAINER_NAME", "bronze")
 
-# ---------------------------------------------------------------------------
-# Keyword patterns for classification
-# ---------------------------------------------------------------------------
-PIT_KW = re.compile(r"\b(box|pit|pitting|pit\s*stop|pit\s*lane|pit\s*wall|pit\s*now|box\s*box)\b", re.I)
-TIRE_KW = re.compile(r"\b(tyre|tire|soft|medium|hard|inter|wet|compound|graining|degradation|deg|blistering|wear)\b", re.I)
-SAFETY_KW = re.compile(r"\b(yellow|safety\s*car|vsc|virtual|red\s*flag|caution|incident|crash|off|barrier|debris)\b", re.I)
-PACE_KW = re.compile(r"\b(push|pushing|attack|lift|coast|lift\s*and\s*coast|delta|target|pace|manage|conserve|save)\b", re.I)
-DAMAGE_KW = re.compile(r"\b(damage|wing|floor|puncture|broken|loose|endplate)\b", re.I)
-MECH_KW = re.compile(r"\b(engine|power\s*unit|gearbox|brake|battery|ers|mgu|overheating|temperature|cooling|hydraulic|steering)\b", re.I)
-WEATHER_KW = re.compile(r"\b(rain|wet|dry|drizzle|shower|spray|standing\s*water)\b", re.I)
+# --- 1. Configuration ---
+def get_storage_options():
+    return {
+        "account_name": os.getenv("STORAGE_ACCOUNT_NAME"),
+        "account_key": os.getenv("STORAGE_ACCOUNT_KEY"),
+    }
+
+
+def _abfs_path(container, filename):
+    return f"abfs://{container}@{os.getenv('STORAGE_ACCOUNT_NAME')}.dfs.core.windows.net/{filename}"
+
+
+# --- 2. Driver Number → Abbreviation ---
+DRIVER_NUMBER_TO_ABB = {
+    1: "VER",  4: "NOR",  5: "VET",  6: "HAD",  7: "DOO",
+    10: "GAS", 11: "PER", 12: "ANT", 14: "ALO", 16: "LEC",
+    18: "STR", 20: "MAG", 22: "TSU", 23: "ALB", 24: "ZHO",
+    27: "HUL", 30: "LAW", 31: "OCO", 43: "COL", 44: "HAM",
+    50: "BOR", 55: "SAI", 63: "RUS", 77: "BOT", 81: "PIA",
+    87: "BEA",
+}
+
+
+# --- 3. Keyword Patterns ---
+PIT_KW      = re.compile(r"\b(box|pit|pitting|pit\s*stop|pit\s*lane|pit\s*wall|pit\s*now|box\s*box)\b", re.I)
+TIRE_KW     = re.compile(r"\b(tyre|tire|soft|medium|hard|inter|wet|compound|graining|degradation|deg|blistering|wear)\b", re.I)
+SAFETY_KW   = re.compile(r"\b(yellow|safety\s*car|vsc|virtual|red\s*flag|caution|incident|crash|off|barrier|debris)\b", re.I)
+PACE_KW     = re.compile(r"\b(push|pushing|attack|lift|coast|lift\s*and\s*coast|delta|target|pace|manage|conserve|save)\b", re.I)
+DAMAGE_KW   = re.compile(r"\b(damage|wing|floor|puncture|broken|loose|endplate)\b", re.I)
+MECH_KW     = re.compile(r"\b(engine|power\s*unit|gearbox|brake|battery|ers|mgu|overheating|temperature|cooling|hydraulic|steering)\b", re.I)
+WEATHER_KW  = re.compile(r"\b(rain|wet|dry|drizzle|shower|spray|standing\s*water)\b", re.I)
 OVERTAKE_KW = re.compile(r"\b(overtake|pass|passing|move|sent\s*it|inside|outside|late\s*brake)\b", re.I)
-DEFEND_KW = re.compile(r"\b(defend|defending|cover|position|hold|protect)\b", re.I)
-DRS_KW = re.compile(r"\b(drs|detection|activation)\b", re.I)
-TRAFFIC_KW = re.compile(r"\b(traffic|blue\s*flag|backmarker|lapped)\b", re.I)
-GAP_KW = re.compile(r"\b(gap|interval|behind|ahead|margin|undercut|overcut)\b", re.I)
+DEFEND_KW   = re.compile(r"\b(defend|defending|cover|position|hold|protect)\b", re.I)
+DRS_KW      = re.compile(r"\b(drs|detection|activation)\b", re.I)
+TRAFFIC_KW  = re.compile(r"\b(traffic|blue\s*flag|backmarker|lapped)\b", re.I)
+GAP_KW      = re.compile(r"\b(gap|interval|behind|ahead|margin|undercut|overcut)\b", re.I)
 POSITIVE_KW = re.compile(r"\b(well\s*done|great|nice|perfect|brilliant|fantastic|good\s*job|p[1-3]|win|winner|podium|congratulations)\b", re.I)
 
 ALL_PATTERNS = [PIT_KW, TIRE_KW, SAFETY_KW, PACE_KW, DAMAGE_KW, MECH_KW,
                 WEATHER_KW, OVERTAKE_KW, DEFEND_KW, DRS_KW, TRAFFIC_KW]
 
 
-# ---------------------------------------------------------------------------
-# Data fetching
-# ---------------------------------------------------------------------------
+# --- 4. OpenF1 Fetching ---
 def fetch_sessions():
-    log.info("Fetching sessions from OpenF1 API...")
+    log.info("Fetching sessions from OpenF1...")
     resp = requests.get(f"{BASE_URL}/sessions", timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     df = pd.DataFrame(resp.json())
@@ -104,74 +91,80 @@ def fetch_sessions():
 
 
 def fetch_team_radio(session_key=None):
-    url = f"{BASE_URL}/team_radio"
-    params = {}
-    if session_key:
-        params["session_key"] = session_key
+    params = {"session_key": session_key} if session_key else {}
     log.info("Fetching team radio%s...", f" for session {session_key}" if session_key else "")
-    resp = requests.get(url, params=params, timeout=120)
+    resp = requests.get(f"{BASE_URL}/team_radio", params=params, timeout=120)
     resp.raise_for_status()
     df = pd.DataFrame(resp.json())
     log.info("  %d recordings fetched", len(df))
     return df
 
 
-def filter_race_radio(radio_df, sessions_df):
-    race_keys = sessions_df[sessions_df["session_type"] == "Race"]["session_key"]
-    filtered = radio_df[radio_df["session_key"].isin(race_keys)].reset_index(drop=True)
-    log.info("  %d race-only recordings after filtering", len(filtered))
-    return filtered
+# --- 5. Bronze Layer ---
+def run_radio_bronze(session_key=None):
+    """
+    Fetch team radio from OpenF1 and store raw JSON to ADLS bronze/radio_bronze.json.
+    Returns the ADLS path written to.
+    """
+    storage_options = get_storage_options()
+    bronze_container = os.getenv("BRONZE_CONTAINER", "bronze")
+
+    sessions = fetch_sessions()
+    radio = fetch_team_radio(session_key=session_key)
+
+    if session_key is None:
+        race_keys = sessions[sessions["session_type"] == "Race"]["session_key"]
+        radio = radio[radio["session_key"].isin(race_keys)].reset_index(drop=True)
+        log.info("  %d race-only recordings after filtering", len(radio))
+
+    if radio.empty:
+        log.warning("No radio recordings found.")
+        return None
+
+    output_path = _abfs_path(bronze_container, "radio_bronze.json")
+    records = radio.to_dict(orient="records")
+
+    with fsspec.open(output_path, "w", **storage_options) as f:
+        json.dump(records, f)
+
+    log.info("Stored %d raw recordings to %s", len(records), output_path)
+    return output_path
 
 
-# ---------------------------------------------------------------------------
-# Classification
-# ---------------------------------------------------------------------------
+# --- 6. Classification ---
 def classify_radio(transcript, record):
     text = transcript.strip()
     text_lower = text.lower()
 
     hits = {
-        "pit": bool(PIT_KW.search(text)),
-        "tire": bool(TIRE_KW.search(text)),
-        "safety": bool(SAFETY_KW.search(text)),
-        "pace": bool(PACE_KW.search(text)),
-        "damage": bool(DAMAGE_KW.search(text)),
-        "mech": bool(MECH_KW.search(text)),
-        "weather": bool(WEATHER_KW.search(text)),
+        "pit":      bool(PIT_KW.search(text)),
+        "tire":     bool(TIRE_KW.search(text)),
+        "safety":   bool(SAFETY_KW.search(text)),
+        "pace":     bool(PACE_KW.search(text)),
+        "damage":   bool(DAMAGE_KW.search(text)),
+        "mech":     bool(MECH_KW.search(text)),
+        "weather":  bool(WEATHER_KW.search(text)),
         "overtake": bool(OVERTAKE_KW.search(text)),
-        "defend": bool(DEFEND_KW.search(text)),
-        "drs": bool(DRS_KW.search(text)),
-        "traffic": bool(TRAFFIC_KW.search(text)),
-        "gap": bool(GAP_KW.search(text)),
+        "defend":   bool(DEFEND_KW.search(text)),
+        "drs":      bool(DRS_KW.search(text)),
+        "traffic":  bool(TRAFFIC_KW.search(text)),
+        "gap":      bool(GAP_KW.search(text)),
         "positive": bool(POSITIVE_KW.search(text)),
     }
 
-    # Primary event type
     primary = "information_only"
-    if hits["pit"] and ("box" in text_lower or "pit" in text_lower):
-        primary = "pit_call"
-    elif hits["damage"]:
-        primary = "damage_issue"
-    elif hits["mech"]:
-        primary = "mechanical_issue"
-    elif hits["safety"]:
-        primary = "safety"
-    elif hits["weather"]:
-        primary = "weather"
-    elif hits["tire"] and not hits["pit"]:
-        primary = "tire_strategy"
-    elif hits["pace"]:
-        primary = "pace_management"
-    elif hits["overtake"]:
-        primary = "overtaking"
-    elif hits["defend"]:
-        primary = "defending"
-    elif hits["traffic"]:
-        primary = "traffic"
-    elif hits["positive"]:
-        primary = "celebration"
+    if hits["pit"] and ("box" in text_lower or "pit" in text_lower): primary = "pit_call"
+    elif hits["damage"]:                    primary = "damage_issue"
+    elif hits["mech"]:                      primary = "mechanical_issue"
+    elif hits["safety"]:                    primary = "safety"
+    elif hits["weather"]:                   primary = "weather"
+    elif hits["tire"] and not hits["pit"]:  primary = "tire_strategy"
+    elif hits["pace"]:                      primary = "pace_management"
+    elif hits["overtake"]:                  primary = "overtaking"
+    elif hits["defend"]:                    primary = "defending"
+    elif hits["traffic"]:                   primary = "traffic"
+    elif hits["positive"]:                  primary = "celebration"
 
-    # Secondary labels
     secondary = []
     label_map = [
         ("tire", "tire_strategy"), ("pit", "pit_call"), ("safety", "safety"),
@@ -183,7 +176,6 @@ def classify_radio(transcript, record):
         if hits[key] and label != primary and label not in secondary:
             secondary.append(label)
 
-    # Action type
     action_required = True
     if primary == "pit_call" and "box" in text_lower:
         action_type = "pit_now"
@@ -210,7 +202,6 @@ def classify_radio(transcript, record):
         action_type = "unknown"
         action_required = False
 
-    # Urgency
     if primary in ("pit_call", "damage_issue", "safety") or "now" in text_lower:
         urgency = "high"
     elif primary in ("mechanical_issue", "pace_management", "tire_strategy", "defending"):
@@ -218,30 +209,19 @@ def classify_radio(transcript, record):
     else:
         urgency = "low"
 
-    # Sentiment
-    if hits["positive"]:
-        sentiment = "positive"
-    elif hits["damage"] or hits["mech"]:
-        sentiment = "negative"
-    elif urgency == "high":
-        sentiment = "urgent"
-    else:
-        sentiment = "neutral"
+    if hits["positive"]:                 sentiment = "positive"
+    elif hits["damage"] or hits["mech"]: sentiment = "negative"
+    elif urgency == "high":              sentiment = "urgent"
+    else:                                sentiment = "neutral"
 
-    # Quality & confidence
     word_count = len(text.split())
-    quality = "low" if word_count < 3 else ("medium" if word_count < 8 else "high")
+    quality = "low" if word_count < 3 else "medium" if word_count < 8 else "high"
     keyword_hits = sum(1 for v in hits.values() if v)
-    if keyword_hits >= 2 and quality == "high":
-        confidence = 0.85
-    elif keyword_hits >= 1 and quality != "low":
-        confidence = 0.7
-    elif keyword_hits >= 1:
-        confidence = 0.5
-    else:
-        confidence = 0.35
+    if keyword_hits >= 2 and quality == "high":   confidence = 0.85
+    elif keyword_hits >= 1 and quality != "low":  confidence = 0.7
+    elif keyword_hits >= 1:                       confidence = 0.5
+    else:                                         confidence = 0.35
 
-    # Evidence phrases
     evidence = []
     for pattern in ALL_PATTERNS:
         for match in pattern.finditer(text):
@@ -251,15 +231,8 @@ def classify_radio(transcript, record):
             if snippet and snippet not in evidence:
                 evidence.append(snippet)
 
-    # Car issue signal
-    issue_type, severity = "none", "none"
     if hits["damage"]:
-        if "wing" in text_lower:
-            issue_type = "wing_damage"
-        elif "floor" in text_lower:
-            issue_type = "floor_damage"
-        else:
-            issue_type = "unknown"
+        issue_type = "wing_damage" if "wing" in text_lower else "floor_damage" if "floor" in text_lower else "unknown"
         severity = "moderate"
     elif hits["mech"]:
         for kw, it in [("engine", "engine"), ("power unit", "engine"), ("brake", "brakes"),
@@ -272,8 +245,10 @@ def classify_radio(transcript, record):
         else:
             issue_type = "unknown"
         severity = "minor"
+    else:
+        issue_type = "none"
+        severity = "none"
 
-    # Summary
     if primary == "pit_call":
         summary = "Pit call communicated."
     elif primary == "celebration":
@@ -284,9 +259,14 @@ def classify_radio(transcript, record):
         parts = [primary.replace("_", " ").title()] + [s.replace("_", " ") for s in secondary[:2]]
         summary = f"{'. '.join(parts)} related communication."
 
+    driver_num = record.get("driver_number")
+    driver_num_int = int(driver_num) if driver_num is not None and pd.notna(driver_num) else None
+    driver_abb = DRIVER_NUMBER_TO_ABB.get(driver_num_int, "UNK")
+
     return {
         "date": record.get("date"),
-        "driver_number": int(record["driver_number"]) if pd.notna(record.get("driver_number")) else None,
+        "driver_number": driver_num_int,
+        "driver_abb": driver_abb,
         "meeting_key": int(record["meeting_key"]) if pd.notna(record.get("meeting_key")) else None,
         "session_key": int(record["session_key"]) if pd.notna(record.get("session_key")) else None,
         "recording_url": record.get("recording_url"),
@@ -322,29 +302,52 @@ def classify_radio(transcript, record):
         },
         "confidence": confidence,
         "evidence_phrases": evidence[:5],
-        "notes": "" if confidence >= 0.7 else "Low confidence — transcript may be noisy or too short.",
+        "notes": "" if confidence >= 0.7 else "Low confidence — transcript may be noisy or too short for reliable classification.",
     }
 
 
-# ===========================================================================
-# BATCH MODE — Whisper (local transcription)
-# ===========================================================================
-def load_whisper_model(model_size="base"):
+# --- 7. Silver Layer ---
+def run_radio_silver(session_key=None, whisper_model_size="base"):
+    """
+    Read radio_bronze.json from ADLS, transcribe with Whisper, classify,
+    and write partitioned parquet to ADLS silver/radio_silver.parquet
+    (partitioned by year / month / driver_abb).
+
+    Returns nested JSON:
+        { "Status": "Success", "Year": { year: { "Month": { month: { driver_abb: { event_type: count } } } } } }
+    """
+    storage_options = get_storage_options()
+    bronze_container = os.getenv("BRONZE_CONTAINER", "bronze")
+    silver_container = os.getenv("SILVER_CONTAINER", "silver")
+
+    input_path = _abfs_path(bronze_container, "radio_bronze.json")
+    log.info("Reading bronze data from %s", input_path)
+
+    with fsspec.open(input_path, "r", **storage_options) as f:
+        raw_data = json.load(f)
+
+    if session_key:
+        raw_data = [r for r in raw_data if r.get("session_key") == session_key]
+        log.info("Filtered to %d recordings for session %s", len(raw_data), session_key)
+
+    if not raw_data:
+        log.warning("No records found in bronze.")
+        return {"Status": "No data", "Year": {}}
+
     import torch
     import whisper
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("Loading Whisper '%s' model on %s...", model_size, device)
-    model = whisper.load_model(model_size, device=device)
-    return model
+    log.info("Loading Whisper '%s' on %s...", whisper_model_size, device)
+    model = whisper.load_model(whisper_model_size, device=device)
 
-
-def transcribe_and_classify_batch(radio_df, model):
     events = []
     failed = 0
-    total = len(radio_df)
 
-    for idx, (_, row) in enumerate(radio_df.iterrows()):
-        url = row["recording_url"]
+    for i, record in enumerate(raw_data):
+        url = record.get("recording_url")
+        if not url:
+            failed += 1
+            continue
 
         try:
             r = requests.get(url, timeout=30)
@@ -354,326 +357,161 @@ def transcribe_and_classify_batch(radio_df, model):
             failed += 1
             continue
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            f.write(r.content)
-            tmppath = f.name
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(r.content)
+            tmppath = tmp.name
 
         try:
-            result = model.transcribe(tmppath)
-            transcript = result["text"].strip()
+            transcript = model.transcribe(tmppath)["text"].strip()
         except Exception as e:
-            log.debug("Transcription failed for %s: %s", url, e)
+            log.debug("Transcription failed: %s", e)
             failed += 1
-            os.unlink(tmppath)
             continue
-
-        os.unlink(tmppath)
+        finally:
+            if os.path.exists(tmppath):
+                os.unlink(tmppath)
 
         if not transcript:
             failed += 1
             continue
 
-        event = classify_radio(transcript, row.to_dict())
-        events.append(event)
+        events.append(classify_radio(transcript, record))
 
-        if (idx + 1) % 100 == 0:
-            log.info("  Processed %d/%d (failed: %d)", idx + 1, total, failed)
+        if (i + 1) % 100 == 0:
+            log.info("  Processed %d/%d (failed: %d)", i + 1, len(raw_data), failed)
 
-    log.info("Completed: %d events from %d recordings (%d failed/skipped)", len(events), total, failed)
-    return events
-
-
-def save_results(events, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-
-    json_path = os.path.join(output_dir, "team_radio_events.json")
-    with open(json_path, "w") as f:
-        json.dump(events, f, indent=2)
-    log.info("Saved %d events to %s", len(events), json_path)
-
-    csv_path = os.path.join(output_dir, "team_radio_events.csv")
-    df = pd.json_normalize(events)
-    df.to_csv(csv_path, index=False)
-    log.info("Saved CSV to %s", csv_path)
-
-    return json_path, csv_path
-
-
-def upload_to_adls_bronze(events, session_key=None, race_name=None):
-    """Upload classified radio events to ADLS Gen2 bronze/radio/ as parquet."""
-    if not ADLS_CONNECTION_STR:
-        log.warning("F1_STORAGE_CONNECTION_STRING not set — skipping ADLS upload.")
-        return None
-
-    from azure.storage.filedatalake import DataLakeServiceClient
-    import io
-
-    try:
-        service_client = DataLakeServiceClient.from_connection_string(ADLS_CONNECTION_STR)
-        fs_client = service_client.get_file_system_client(ADLS_CONTAINER_NAME)
-
-        # Build path: bronze/radio/{race_name}-{session_key}/team_radio_events.parquet
-        if race_name and session_key:
-            folder_name = f"{race_name}-{session_key}".replace(" ", "_")
-        elif session_key:
-            folder_name = str(session_key)
-        else:
-            folder_name = "all_sessions"
-        folder = f"radio/{folder_name}"
-
-        # Create directory if it doesn't exist
-        dir_client = fs_client.get_directory_client(folder)
-        dir_client.create_directory()
-
-        # Convert events to parquet bytes
-        df = pd.json_normalize(events)
-        buffer = io.BytesIO()
-        df.to_parquet(buffer, index=False)
-        parquet_bytes = buffer.getvalue()
-
-        # Upload parquet file
-        file_client = dir_client.get_file_client("team_radio_events.parquet")
-        file_client.upload_data(parquet_bytes, overwrite=True)
-
-        adls_path = f"{ADLS_CONTAINER_NAME}/{folder}/team_radio_events.parquet"
-        log.info("Uploaded %d events to ADLS: %s", len(events), adls_path)
-        return adls_path
-
-    except Exception as e:
-        log.error("ADLS upload failed: %s", e)
-        return None
-
-
-def print_summary(events):
-    df = pd.json_normalize(events)
-    log.info("--- Summary ---")
-    log.info("Event type distribution:\n%s", df["primary_event_type"].value_counts().to_string())
-    log.info("Urgency distribution:\n%s", df["urgency_level"].value_counts().to_string())
-
-    strategy_cols = [c for c in df.columns if c.startswith("strategy_signal.")]
-    for col in strategy_cols:
-        label = col.split(".")[1]
-        log.info("  Strategy signal %-20s %5d occurrences", label, df[col].sum())
-
-
-def run_batch(session_key=None, output_dir=None, whisper_model="base"):
-    log.info("=" * 60)
-    log.info("F1 Team Radio Pipeline — BATCH MODE (Whisper)")
-    log.info("=" * 60)
-
-    if output_dir is None:
-        output_dir = os.path.join(os.path.dirname(__file__), "..", "data")
-
-    sessions = fetch_sessions()
-    radio = fetch_team_radio(session_key=session_key)
-
-    if session_key is None:
-        radio = filter_race_radio(radio, sessions)
-
-    if radio.empty:
-        log.warning("No radio recordings found. Exiting.")
-        return []
-
-    model = load_whisper_model(whisper_model)
-    events = transcribe_and_classify_batch(radio, model)
+    log.info("Classified %d events (%d failed/skipped)", len(events), failed)
 
     if not events:
-        log.warning("No events produced. Exiting.")
-        return []
+        return {"Status": "No events produced", "Year": {}}
 
-    save_results(events, output_dir)
+    df = pd.json_normalize(events)
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    df["year"] = df["date"].dt.year.astype(str)
+    df["month"] = df["date"].dt.month.astype(str)
 
-    # Look up race name from sessions for ADLS folder naming
-    race_name = None
-    if session_key is not None:
-        match = sessions[sessions["session_key"] == session_key]
-        if not match.empty:
-            race_name = match.iloc[0].get("location", None)
-
-    upload_to_adls_bronze(events, session_key=session_key, race_name=race_name)
-    print_summary(events)
-    return events
-
-
-# ===========================================================================
-# LIVE MODE — Azure Speech Services + Event Hub
-# ===========================================================================
-def transcribe_with_azure_speech(audio_content):
-    """Transcribe audio bytes using Azure Speech Services REST API."""
-    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-        log.error("AZURE_SPEECH_KEY or AZURE_SPEECH_REGION not set.")
-        return None
-
-    endpoint = (
-        f"https://{AZURE_SPEECH_REGION}.stt.speech.microsoft.com"
-        f"/speech/recognition/conversation/cognitiveservices/v1"
-        f"?language=en-US"
+    output_path = _abfs_path(silver_container, "radio_silver.parquet")
+    df.to_parquet(
+        output_path,
+        index=False,
+        storage_options=storage_options,
+        partition_cols=["year", "month", "driver_abb"],
     )
-    headers = {
-        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
-        "Content-Type": "audio/mpeg",
-        "Accept": "application/json",
-    }
+    log.info("Written parquet to %s", output_path)
 
-    try:
-        resp = requests.post(endpoint, headers=headers, data=audio_content, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()
+    grouped = (
+        df.groupby(["year", "month", "driver_abb", "primary_event_type"])
+        .size()
+        .reset_index(name="count")
+    )
 
-        if result.get("RecognitionStatus") == "Success":
-            return result.get("DisplayText", "").strip()
-        else:
-            log.debug("Azure Speech status: %s", result.get("RecognitionStatus"))
-            return None
-    except Exception as e:
-        log.error("Azure Speech transcription failed: %s", e)
-        return None
-
-
-def push_to_event_hub(data, label="radio"):
-    """Push a list of records to Azure Event Hub as JSON EventData messages."""
-    if not data:
-        return
-
-    if not EVENT_HUB_CONNECTION_STR or not EVENT_HUB_NAME:
-        log.warning("Event Hub not configured — dry-run mode.")
-        log.info("[DRY RUN] Would push %d %s records.", len(data), label)
-        for record in data[:2]:
-            log.debug(json.dumps(record, indent=2, default=str))
-        return
-
-    from azure.eventhub import EventHubProducerClient, EventData
-
-    try:
-        producer = EventHubProducerClient.from_connection_string(
-            conn_str=EVENT_HUB_CONNECTION_STR,
-            eventhub_name=EVENT_HUB_NAME,
+    nested = {}
+    for _, row in grouped.iterrows():
+        year, month, driver, event_type, count = (
+            row["year"], row["month"], row["driver_abb"],
+            row["primary_event_type"], row["count"],
         )
-        with producer:
-            batch = producer.create_batch()
-            for record in data:
-                try:
-                    batch.add(EventData(json.dumps(record, default=str)))
-                except ValueError:
-                    producer.send_batch(batch)
-                    log.info("Batch full — sent intermediate batch.")
-                    batch = producer.create_batch()
-                    batch.add(EventData(json.dumps(record, default=str)))
-            producer.send_batch(batch)
+        nested.setdefault(year, {}).setdefault("Month", {}).setdefault(month, {}).setdefault(driver, {})[event_type] = int(count)
 
-        log.info("Pushed %d %s records to Azure Event Hub.", len(data), label)
-
-    except Exception as e:
-        log.error("Event Hub push failed: %s", e, exc_info=True)
+    return {"Status": "Success", "Year": nested}
 
 
-def run_live(session_key, poll_interval=10):
-    """
-    Live mode: poll OpenF1 for new radio recordings, transcribe with Azure Speech
-    Services, classify, and push to Event Hub in near-real-time.
-    """
-    log.info("=" * 60)
-    log.info("F1 Team Radio Pipeline — LIVE MODE (Azure Speech Services)")
-    log.info("  Session key : %s", session_key)
-    log.info("  Poll interval: %ds", poll_interval)
-    log.info("  Event Hub    : %s", "configured" if EVENT_HUB_CONNECTION_STR else "NOT SET (dry-run)")
-    log.info("  Speech Svc   : %s", "configured" if AZURE_SPEECH_KEY else "NOT SET")
-    log.info("=" * 60)
-
-    if not AZURE_SPEECH_KEY:
-        log.error("AZURE_SPEECH_KEY is required for live mode. Exiting.")
-        return
-
-    seen_urls = set()
-    total_pushed = 0
-
-    log.info("Starting live polling loop. Press Ctrl+C to stop.")
-
-    try:
-        while True:
-            try:
-                radio = fetch_team_radio(session_key=session_key)
-            except Exception as e:
-                log.error("Failed to fetch radio data: %s", e)
-                time.sleep(poll_interval)
-                continue
-
-            if radio.empty:
-                log.info("No radio data yet. Waiting...")
-                time.sleep(poll_interval)
-                continue
-
-            # Filter to only new recordings
-            new_rows = radio[~radio["recording_url"].isin(seen_urls)]
-            if new_rows.empty:
-                log.info("No new recordings. (%d total seen)", len(seen_urls))
-                time.sleep(poll_interval)
-                continue
-
-            log.info("Found %d new recordings to process.", len(new_rows))
-            events = []
-
-            for _, row in new_rows.iterrows():
-                url = row["recording_url"]
-                seen_urls.add(url)
-
-                # Download audio
-                try:
-                    r = requests.get(url, timeout=30)
-                    r.raise_for_status()
-                except Exception as e:
-                    log.debug("Download failed for %s: %s", url, e)
-                    continue
-
-                # Transcribe with Azure Speech Services
-                transcript = transcribe_with_azure_speech(r.content)
-                if not transcript:
-                    continue
-
-                # Classify
-                event = classify_radio(transcript, row.to_dict())
-                events.append(event)
-                log.info("  Driver %s | %s | %s",
-                         event.get("driver_number"), event["primary_event_type"],
-                         transcript[:60])
-
-            if events:
-                push_to_event_hub(events, label="live-radio")
-                total_pushed += len(events)
-                log.info("Total events pushed this session: %d", total_pushed)
-
-            time.sleep(poll_interval)
-
-    except KeyboardInterrupt:
-        log.info("Live polling stopped by user. Total events pushed: %d", total_pushed)
-
-
-# ===========================================================================
-# MAIN
-# ===========================================================================
-def main():
-    parser = argparse.ArgumentParser(description="F1 Team Radio Pipeline")
-    parser.add_argument("--live", action="store_true",
-                        help="Run in live mode (Azure Speech + Event Hub)")
-    parser.add_argument("--session-key", type=int, default=None,
-                        help="Process a specific session key (required for live mode)")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output directory for batch mode (default: data/)")
-    parser.add_argument("--whisper-model", type=str, default="base",
-                        choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model size for batch mode (default: base)")
-    parser.add_argument("--poll-interval", type=int, default=10,
-                        help="Seconds between polls in live mode (default: 10)")
-    args = parser.parse_args()
-
-    if args.live:
-        if not args.session_key:
-            parser.error("--session-key is required for live mode")
-        run_live(session_key=args.session_key, poll_interval=args.poll_interval)
-    else:
-        run_batch(session_key=args.session_key, output_dir=args.output_dir,
-                  whisper_model=args.whisper_model)
+# --- 8. Live Layer (commented out) ---
+# def run_radio_live(session_key, poll_interval=10):
+#     """
+#     Live mode: poll OpenF1 for new radio, transcribe with Azure Speech Services,
+#     classify, and push events to Azure Event Hub.
+#     Requires: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
+#               EVENT_HUB_CONNECTION_STRING, EVENT_HUB_NAME
+#     """
+#     import time
+#     speech_key    = os.getenv("AZURE_SPEECH_KEY", "")
+#     speech_region = os.getenv("AZURE_SPEECH_REGION", "")
+#     eh_conn       = os.getenv("EVENT_HUB_CONNECTION_STRING", "")
+#     eh_name       = os.getenv("EVENT_HUB_NAME", "")
+#
+#     if not speech_key:
+#         log.error("AZURE_SPEECH_KEY is required for live mode.")
+#         return
+#
+#     def _transcribe_azure(audio_bytes):
+#         endpoint = (
+#             f"https://{speech_region}.stt.speech.microsoft.com"
+#             "/speech/recognition/conversation/cognitiveservices/v1?language=en-US"
+#         )
+#         headers = {
+#             "Ocp-Apim-Subscription-Key": speech_key,
+#             "Content-Type": "audio/mpeg",
+#             "Accept": "application/json",
+#         }
+#         resp = requests.post(endpoint, headers=headers, data=audio_bytes, timeout=30)
+#         resp.raise_for_status()
+#         result = resp.json()
+#         return result.get("DisplayText", "").strip() if result.get("RecognitionStatus") == "Success" else None
+#
+#     def _push_to_event_hub(events):
+#         if not eh_conn or not eh_name:
+#             log.warning("[DRY RUN] Would push %d events.", len(events))
+#             return
+#         from azure.eventhub import EventHubProducerClient, EventData
+#         producer = EventHubProducerClient.from_connection_string(eh_conn, eventhub_name=eh_name)
+#         with producer:
+#             batch = producer.create_batch()
+#             for ev in events:
+#                 try:
+#                     batch.add(EventData(json.dumps(ev, default=str)))
+#                 except ValueError:
+#                     producer.send_batch(batch)
+#                     batch = producer.create_batch()
+#                     batch.add(EventData(json.dumps(ev, default=str)))
+#             producer.send_batch(batch)
+#         log.info("Pushed %d events to Event Hub.", len(events))
+#
+#     seen_urls = set()
+#     log.info("Starting live radio polling for session %s (interval: %ds)...", session_key, poll_interval)
+#     try:
+#         while True:
+#             try:
+#                 radio = fetch_team_radio(session_key=session_key)
+#             except Exception as e:
+#                 log.error("Fetch failed: %s", e)
+#                 time.sleep(poll_interval)
+#                 continue
+#
+#             new_rows = radio[~radio["recording_url"].isin(seen_urls)]
+#             events = []
+#             for _, row in new_rows.iterrows():
+#                 url = row["recording_url"]
+#                 seen_urls.add(url)
+#                 try:
+#                     r = requests.get(url, timeout=30)
+#                     r.raise_for_status()
+#                 except Exception:
+#                     continue
+#                 transcript = _transcribe_azure(r.content)
+#                 if transcript:
+#                     events.append(classify_radio(transcript, row.to_dict()))
+#             if events:
+#                 _push_to_event_hub(events)
+#             time.sleep(poll_interval)
+#     except KeyboardInterrupt:
+#         log.info("Live polling stopped.")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="F1 Radio Medallion Pipeline")
+    parser.add_argument("--stage", choices=["bronze", "silver"], default="bronze",
+                        help="Pipeline stage to run")
+    parser.add_argument("--session-key", type=int, default=None,
+                        help="Specific OpenF1 session key (optional)")
+    parser.add_argument("--whisper-model", type=str, default="base",
+                        choices=["tiny", "base", "small", "medium", "large"],
+                        help="Whisper model size for silver transcription")
+    args = parser.parse_args()
+
+    if args.stage == "bronze":
+        run_radio_bronze(session_key=args.session_key)
+    elif args.stage == "silver":
+        result = run_radio_silver(session_key=args.session_key, whisper_model_size=args.whisper_model)
+        print(json.dumps(result, indent=2))
