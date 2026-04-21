@@ -126,26 +126,26 @@ def run_social_processor():
 
         df_silver = pd.DataFrame(processed_rows)
 
-        # Save partitioned Parquet to Silver
-        output_parquet = _abfs_path(silver_container, "social_media_analysis.parquet")
-        df_silver.to_parquet(output_parquet, index=False, storage_options=storage_options, partition_cols=['year', 'month'])
-
         # Build Nested Dictionary Output
         grouped = df_silver.groupby(['year', 'month', 'driver_abb'])['life_score'].mean().round(1)
-        
-        nested_output = {}
-        for (year, month, driver), score in grouped.items():
-            if year not in nested_output:
-                nested_output[year] = {"Month": {}}
-            if month not in nested_output[year]["Month"]:
-                nested_output[year]["Month"][month] = {}
-            
-            nested_output[year]["Month"][month][driver] = score
 
-        final_response = {
-            "Status": "Success",
-            "Year": nested_output
-        }
+        final_response = {"Status": "Success"}
+
+        for (year, month, driver), score in grouped.items():
+            # If the year key doesn't exist, create it as a dict
+            if year not in final_response:
+                final_response[year] = {}
+            
+            # If the month key doesn't exist under that year, create it
+            if month not in final_response[year]:
+                final_response[year][month] = {}
+            
+            # Assign the driver score
+            final_response[year][month][driver] = score
+
+        output_json_path = _abfs_path(silver_container, "social_media_silver.json")
+        with fsspec.open(output_json_path, 'w', **storage_options) as f:
+            json.dump(final_response, f, indent=4)
 
         return final_response
 
