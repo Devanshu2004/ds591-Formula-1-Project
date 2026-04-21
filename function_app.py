@@ -258,6 +258,82 @@ def run_gold(req: func.HttpRequest) -> func.HttpResponse:
             "message": str(e)
         }, 500)
 
+# ── RADIO: BRONZE ─────────────────────────────────────────────────────────────
+@app.route(route="run_radio_bronze", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def run_radio_bronze(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Fetch team radio from OpenF1 and store raw JSON to ADLS bronze.
+    POST /api/run_radio_bronze
+
+    Optional JSON body:
+    {
+      "session_key": 9158
+    }
+    """
+    logging.info("Radio bronze pipeline triggered")
+
+    try:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = {}
+
+        session_key = body.get("session_key", None)
+
+        from src.radio_data import run_radio_bronze as _run_radio_bronze
+        output_path = _run_radio_bronze(session_key=session_key)
+
+        return json_response({
+            "status": "success",
+            "message": "Radio bronze pipeline completed",
+            "session_key": session_key,
+            "output_path": output_path,
+        }, 200)
+
+    except Exception as e:
+        logging.exception(f"Radio bronze failed: {e}")
+        return json_response({"status": "error", "message": str(e)}, 500)
+
+
+# ── RADIO: SILVER ──────────────────────────────────────────────────────────────
+@app.route(route="run_radio_silver", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def run_radio_silver(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Transcribe + classify radio from bronze, write partitioned parquet to silver.
+    POST /api/run_radio_silver
+
+    Optional JSON body:
+    {
+      "session_key": 9158,
+      "whisper_model": "base"
+    }
+    """
+    logging.info("Radio silver pipeline triggered")
+
+    try:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = {}
+
+        session_key   = body.get("session_key", None)
+        whisper_model = body.get("whisper_model", "base")
+
+        from src.radio_data import run_radio_silver as _run_radio_silver
+        result = _run_radio_silver(session_key=session_key, whisper_model_size=whisper_model)
+
+        return json_response({
+            "status": "success",
+            "message": "Radio silver pipeline completed",
+            "session_key": session_key,
+            "radio_events": result,
+        }, 200)
+
+    except Exception as e:
+        logging.exception(f"Radio silver failed: {e}")
+        return json_response({"status": "error", "message": str(e)}, 500)
+
+
 # ── SOCIAL MEDIA ANALYSIS ──────────────────────────────────────────────────────
 @app.route(route="process_social", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def run_social_media_pipeline(req: func.HttpRequest) -> func.HttpResponse:
