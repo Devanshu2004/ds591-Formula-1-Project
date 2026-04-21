@@ -390,28 +390,28 @@ def run_radio_silver(session_key=None, whisper_model_size="base"):
     df["year"] = df["date"].dt.year.astype(str)
     df["month"] = df["date"].dt.month.astype(str)
 
-    output_path = _abfs_path(silver_container, "radio_silver.parquet")
+    output_path = _abfs_path(silver_container, "radio_data")
     df.to_parquet(
         output_path,
         index=False,
         storage_options=storage_options,
-        partition_cols=["year", "month", "driver_abb"],
+        partition_cols=["year", "driver_abb"],
     )
     log.info("Written parquet to %s", output_path)
 
     grouped = (
-        df.groupby(["year", "month", "driver_abb", "primary_event_type"])
+        df.groupby(["year", "driver_abb", "primary_event_type"])
         .size()
         .reset_index(name="count")
     )
 
     nested = {}
     for _, row in grouped.iterrows():
-        year, month, driver, event_type, count = (
-            row["year"], row["month"], row["driver_abb"],
+        year, driver, event_type, count = (
+            row["year"], row["driver_abb"],
             row["primary_event_type"], row["count"],
         )
-        nested.setdefault(year, {}).setdefault("Month", {}).setdefault(month, {}).setdefault(driver, {})[event_type] = int(count)
+        nested.setdefault(year, {}).setdefault(driver, {})[event_type] = int(count)
 
     return {"Status": "Success", "Year": nested}
 
