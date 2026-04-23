@@ -416,7 +416,7 @@ def run_radio_silver(session_key=None, whisper_model_size="base"):
     return {"Status": "Success", "Year": nested}
 
 
-# --- 8. Live Layer (commented out) ---
+# --- 8. Live Layer ---
 # def run_radio_live(session_key, poll_interval=10):
 #     """
 #     Live mode: poll OpenF1 for new radio, transcribe with Azure Speech Services,
