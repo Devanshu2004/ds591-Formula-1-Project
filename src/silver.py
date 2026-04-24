@@ -1,27 +1,29 @@
 import os
 import logging
-from typing import Optional, Tuple
+import gc
+import re
+from typing import List, Optional, Tuple
 import pandas as pd
 import fsspec
 
 
 # --------------------------- Configuration ------------------------------
-# YEARS = [2024, 2025]
-YEARS=[2024]
-SESSION_TYPE = os.getenv("SESSION_TYPE", "R")
-TARGET_DRIVER = os.getenv("TARGET_DRIVER", "LEC")
+# default values
+YEARS_ENV = os.getenv("YEARS", "2024,2025")
+YEARS = [int(y.strip()) for y in YEARS_ENV.split(",") if y.strip()]
 
-race_locations = [
-    "Italian Grand Prix" 
-    # , "Azerbaijan Grand Prix", "Singapore Grand Prix", "Mexico City Grand Prix",
-    # "Brazilian Grand Prix", "Las Vegas Grand Prix", "Qatar Grand Prix", "Abu Dhabi Grand Prix",
-    # "United States Grand Prix", "Australian Grand Prix", "Austrian Grand Prix", "Bahrain Grand Prix",
-    # "Belgian Grand Prix", "British Grand Prix", "Canadian Grand Prix", "Chinese Grand Prix",
-    # "Dutch Grand Prix", "Eifel Grand Prix", "Emilia Romagna Grand Prix", "French Grand Prix",
-    # "German Grand Prix", "Hungarian Grand Prix", "Japanese Grand Prix", "Miami Grand Prix",
-    # "Monaco Grand Prix", "Portuguese Grand Prix", "Russian Grand Prix", "Sakhir Grand Prix",
-    # "Saudi Arabian Grand Prix", "Spanish Grand Prix", "Styrian Grand Prix", "São Paulo Grand Prix",
-    # "Turkish Grand Prix", "Tuscan Grand Prix"
+SESSION_TYPE = "R"
+
+RACE_LOCATIONS = [
+    "Italian Grand Prix", "Azerbaijan Grand Prix", "Singapore Grand Prix", "Mexico City Grand Prix",
+    "Brazilian Grand Prix", "Las Vegas Grand Prix", "Qatar Grand Prix", "Abu Dhabi Grand Prix",
+    "United States Grand Prix", "Australian Grand Prix", "Austrian Grand Prix", "Bahrain Grand Prix",
+    "Belgian Grand Prix", "British Grand Prix", "Canadian Grand Prix", "Chinese Grand Prix",
+    "Dutch Grand Prix", "Eifel Grand Prix", "Emilia Romagna Grand Prix", "French Grand Prix",
+    "German Grand Prix", "Hungarian Grand Prix", "Japanese Grand Prix", "Miami Grand Prix",
+    "Monaco Grand Prix", "Portuguese Grand Prix", "Russian Grand Prix", "Sakhir Grand Prix",
+    "Saudi Arabian Grand Prix", "Spanish Grand Prix", "Styrian Grand Prix", "São Paulo Grand Prix",
+    "Turkish Grand Prix", "Tuscan Grand Prix"
 ]
 
 driver_abb = {
@@ -69,6 +71,107 @@ driver_abb = {
     "ZHO": ["Zhou Guanyu"]
 }
 
+RACE_CALENDAR = {
+    2024: {
+        "Bahrain Grand Prix": "2024-03-02",
+        "Saudi Arabian Grand Prix": "2024-03-09",
+        "Australian Grand Prix": "2024-03-24",
+        "Japanese Grand Prix": "2024-04-07",
+        "Chinese Grand Prix": "2024-04-21",
+        "Miami Grand Prix": "2024-05-05",
+        "Emilia Romagna Grand Prix": "2024-05-19",
+        "Monaco Grand Prix": "2024-05-26",
+        "Canadian Grand Prix": "2024-06-09",
+        "Spanish Grand Prix": "2024-06-23",
+        "Austrian Grand Prix": "2024-06-30",
+        "British Grand Prix": "2024-07-07",
+        "Hungarian Grand Prix": "2024-07-21",
+        "Belgian Grand Prix": "2024-07-28",
+        "Dutch Grand Prix": "2024-08-25",
+        "Italian Grand Prix": "2024-09-01",
+        "Azerbaijan Grand Prix": "2024-09-15",
+        "Singapore Grand Prix": "2024-09-22",
+        "United States Grand Prix": "2024-10-20",
+        "Mexico City Grand Prix": "2024-10-27",
+        "São Paulo Grand Prix": "2024-11-03",
+        "Las Vegas Grand Prix": "2024-11-23",
+        "Qatar Grand Prix": "2024-12-01",
+        "Abu Dhabi Grand Prix": "2024-12-08",
+    },
+    2025: {
+        "Australian Grand Prix": "2025-03-16",
+        "Chinese Grand Prix": "2025-03-23",
+        "Japanese Grand Prix": "2025-04-06",
+        "Bahrain Grand Prix": "2025-04-13",
+        "Saudi Arabian Grand Prix": "2025-04-20",
+        "Miami Grand Prix": "2025-05-04",
+        "Emilia Romagna Grand Prix": "2025-05-18",
+        "Monaco Grand Prix": "2025-05-25",
+        "Spanish Grand Prix": "2025-06-01",
+        "Canadian Grand Prix": "2025-06-15",
+        "Austrian Grand Prix": "2025-06-29",
+        "British Grand Prix": "2025-07-06",
+        "Belgian Grand Prix": "2025-07-27",
+        "Hungarian Grand Prix": "2025-08-03",
+        "Dutch Grand Prix": "2025-08-31",
+        "Italian Grand Prix": "2025-09-07",
+        "Azerbaijan Grand Prix": "2025-09-21",
+        "Singapore Grand Prix": "2025-10-05",
+        "United States Grand Prix": "2025-10-19",
+        "Mexico City Grand Prix": "2025-10-26",
+        "São Paulo Grand Prix": "2025-11-09",
+        "Las Vegas Grand Prix": "2025-11-22",
+        "Qatar Grand Prix": "2025-11-30",
+        "Abu Dhabi Grand Prix": "2025-12-07",
+    },
+    2026: {
+        "Australian Grand Prix": "2026-03-08",
+        "Chinese Grand Prix": "2026-03-15",
+        "Japanese Grand Prix": "2026-03-29",
+        "Miami Grand Prix": "2026-05-03",
+        "Canadian Grand Prix": "2026-05-24",
+        "Monaco Grand Prix": "2026-06-07",
+        "Spanish Grand Prix": "2026-06-14",
+        "Austrian Grand Prix": "2026-06-28",
+        "British Grand Prix": "2026-07-05",
+        "Belgian Grand Prix": "2026-07-19",
+        "Hungarian Grand Prix": "2026-07-26",
+        "Dutch Grand Prix": "2026-08-23",
+        "Italian Grand Prix": "2026-09-06",
+        "Azerbaijan Grand Prix": "2026-09-27",
+        "Singapore Grand Prix": "2026-10-11",
+        "United States Grand Prix": "2026-10-25",
+        "Mexico City Grand Prix": "2026-11-01",
+        "São Paulo Grand Prix": "2026-11-08",
+        "Las Vegas Grand Prix": "2026-11-21",
+        "Qatar Grand Prix": "2026-11-29",
+        "Abu Dhabi Grand Prix": "2026-12-06",
+        "Barcelona-Catalunya Grand Prix": "2026-06-14",
+        "Spain Grand Prix": "2026-09-13",
+        "Bahrain Grand Prix": "2026-04-12",
+        "Saudi Arabian Grand Prix": "2026-04-19",
+    }
+}
+
+FLAT_RACE_CALENDAR = {
+    (year, loc): date
+    for year, races in RACE_CALENDAR.items()
+    for loc, date in races.items()
+}
+
+TELEMETRY = [
+    "session_time", "x", "y", "z", "speed", "gear", "rpm", "drs", "brake", "position", "relative_distance"
+]
+
+LAP = [
+    "LapStartTime", "Driver", "DriverNumber", "LapNumber", "TyreLife", "Compound", "Team", "TrackStatus"
+]
+
+WEATHER = [
+    "Time", "AirTemp", "Humidity", "Pressure", "Rainfall",
+    "TrackTemp", "WindDirection", "WindSpeed"
+]
+
 
 def get_storage_options(storage_account: str, storage_key: str) -> dict:
     return {
@@ -89,6 +192,11 @@ def _abfs_path(container: str, relative_path: str) -> str:
     return f"abfs://{container}/{relative_path}"
 
 
+def _exists(fs, abfs_path: str) -> bool:
+    normalized = abfs_path.replace("abfs://", "", 1)
+    return fs.exists(normalized)
+
+
 def _to_seconds(series: pd.Series) -> pd.Series:
     td = pd.to_timedelta(series, errors="coerce")
     return td.dt.total_seconds()
@@ -99,252 +207,315 @@ def _get_bronze_paths(
     race_year: int,
     race_location: str,
     session_type: str,
-    selected_driver: str
+    driver: str
 ) -> Tuple[str, str, str]:
     base = f"{race_year}/{race_location}/{session_type}"
-
-    telemetry_file = _abfs_path(
-        bronze_container,
-        f"{base}/{selected_driver}/{selected_driver}_telemetry.parquet"
-    )
-    overall_file = _abfs_path(
-        bronze_container,
-        f"{base}/{selected_driver}/{selected_driver}_laps.parquet"
-    )
-    weather_file = _abfs_path(
-        bronze_container,
-        f"{base}/weather.parquet"
+    return (
+        _abfs_path(bronze_container, f"{base}/{driver}/{driver}_telemetry.parquet"),
+        _abfs_path(bronze_container, f"{base}/{driver}/{driver}_laps.parquet"),
+        _abfs_path(bronze_container, f"{base}/weather.parquet")
     )
 
-    return telemetry_file, overall_file, weather_file
+
+def add_race_date(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["race_date"] = list(zip(df["race_year"], df["race_location"]))
+    df["race_date"] = df["race_date"].map(FLAT_RACE_CALENDAR)
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    return df
+
+def clean_gear_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    #remove invalid values and fill missing (smooth driving assumption)
+    df["gear"] = pd.to_numeric(df["gear"], errors="coerce")
+    df.loc[~df["gear"].between(0, 8), "gear"] = pd.NA
+    df["gear"] = df["gear"].ffill().bfill()
+
+    return df
 
 
-def _exists(fs, abfs_path: str) -> bool:
-    # fsspec abfs fs.exists expects container/path rather than abfs://...
-    normalized = abfs_path.replace("abfs://", "", 1)
-    return fs.exists(normalized)
+def _prepare_weather(weather_file: str, storage_options: dict) -> pd.DataFrame:
+    try:
+        weather_data = pd.read_parquet(
+            weather_file,
+            columns=[c for c in WEATHER],
+            storage_options=storage_options
+        )
+    except Exception:
+        logging.info(f"Weather file not found or unreadable: {weather_file}")
+        return pd.DataFrame()
+
+    if weather_data.empty:
+        logging.info(f"Weather dataframe empty: {weather_file}")
+        return pd.DataFrame()
+
+    if "Time" not in weather_data.columns:
+        logging.info(f"Weather file missing Time column: {weather_file}")
+        return pd.DataFrame()
+
+    weather_data["Time"] = _to_seconds(weather_data["Time"])
+    weather_data = (
+        weather_data
+        .dropna(subset=["Time"])
+        .sort_values("Time")
+        .reset_index(drop=True)
+    )
+
+    return weather_data
 
 
+def _prepare_driver_race_data(
+    race_year: int,
+    race_location: str,
+    driver: str,
+    bronze_container: str,
+    storage_options: dict,
+    fs
+) -> Optional[pd.DataFrame]:
+    telemetry_file, laps_file, _ = _get_bronze_paths(
+        bronze_container, race_year, race_location, SESSION_TYPE, driver
+    )
 
-def load_data_files(
-    target_driver: str,
-    storage_account: str,
-    storage_key: str,
-    bronze_container: str
+    if not _exists(fs, telemetry_file) or not _exists(fs, laps_file):
+        logging.info(f"Skipping {driver} in {race_location} - missing telemetry or laps file")
+        return None
+
+    try:
+        tel_data = pd.read_parquet(
+            telemetry_file,
+            columns=[c for c in TELEMETRY],
+            storage_options=storage_options
+        )
+        lap_data = pd.read_parquet(
+            laps_file,
+            columns=[c for c in LAP],
+            storage_options=storage_options
+        )
+    except Exception as e:
+        logging.exception(f"Error reading parquet for {driver} in {race_location}: {e}")
+        return None
+
+    tel_data = clean_gear_column(tel_data)
+
+    if "session_time" not in tel_data.columns or "LapStartTime" not in lap_data.columns:
+        logging.info(f"Skipping {driver} in {race_location} - missing required time columns")
+        return None
+
+    tel_data["session_time"] = _to_seconds(tel_data["session_time"])
+    lap_data["LapStartTime"] = _to_seconds(lap_data["LapStartTime"])
+
+    tel_data = tel_data.dropna(subset=["session_time"]).sort_values("session_time").reset_index(drop=True)
+    lap_data = lap_data.dropna(subset=["LapStartTime"]).sort_values("LapStartTime").reset_index(drop=True)
+
+    if tel_data.empty or lap_data.empty:
+        logging.info(f"Skipping {driver} in {race_location} - telemetry or laps empty after cleaning")
+        return None
+
+    merged = pd.merge_asof(
+        tel_data,
+        lap_data,
+        left_on="session_time",
+        right_on="LapStartTime",
+        direction="backward"
+    )
+
+    merged = merged.drop(columns=["LapStartTime"], errors="ignore")
+
+    if merged.empty:
+        logging.info(f"Skipping {driver} in {race_location} - merged dataframe empty")
+        return None
+
+    merged["driver_code"] = driver
+    merged["race_year"] = race_year
+    merged["race_location"] = race_location
+    merged["session_type"] = SESSION_TYPE
+
+    logging.info(f"{driver} merged shape in {race_location}: {merged.shape}")
+    return merged
+
+
+def load_race_data(
+    race_year: int,
+    race_location: str,
+    race_id: int,
+    bronze_container: str,
+    storage_options: dict,
+    fs
 ) -> pd.DataFrame:
-    race_id = 0
-    prepared_data = pd.DataFrame()
+    logging.info("=" * 70)
+    logging.info(f"Processing {race_location} - {race_year}")
+    logging.info("=" * 70)
 
-    storage_options = get_storage_options(storage_account, storage_key)
-    fs = get_filesystem(storage_account, storage_key)
+    driver_frames = []
 
-    for race_year in YEARS:
-        for race_location in race_locations:
-            logging.info("=" * 60)
-            logging.info(f"Processing {race_location} - {race_year}")
-            logging.info("=" * 60)
+    _, _, weather_file = _get_bronze_paths(
+        bronze_container, race_year, race_location, SESSION_TYPE, "LEC"
+    )
+    weather_data = _prepare_weather(weather_file, storage_options)
 
-            driver_data_dict = {}
-            target_driver_times: Optional[pd.DataFrame] = None
-            weather_data_dict: Optional[pd.DataFrame] = None
+    if weather_data.empty:
+        logging.info(f"Skipping race {race_location} - weather missing or empty")
+        return pd.DataFrame()
 
-            for selected_driver in driver_abb.keys():
-                try:
-                    telemetry_file, overall_file, weather_file = _get_bronze_paths(
-                        bronze_container=bronze_container,
-                        race_year=race_year,
-                        race_location=race_location,
-                        session_type=SESSION_TYPE,
-                        selected_driver=selected_driver
-                    )
+    for driver in driver_abb.keys():
+        driver_df = _prepare_driver_race_data(
+            race_year=race_year,
+            race_location=race_location,
+            driver=driver,
+            bronze_container=bronze_container,
+            storage_options=storage_options,
+            fs=fs
+        )
+        if driver_df is None or driver_df.empty:
+            continue
 
-                    if not _exists(fs, telemetry_file) or not _exists(fs, overall_file):
-                        logging.info(f"Skipping {selected_driver} - files not found")
-                        continue
+        driver_df = pd.merge_asof(
+            driver_df.sort_values("session_time"),
+            weather_data.sort_values("Time"),
+            left_on="session_time",
+            right_on="Time",
+            direction="nearest",
+            tolerance=60.0
+        ).drop(columns=["Time"], errors="ignore")
 
-                    logging.info(f"Processing {selected_driver}...")
+        driver_df["race_id"] = race_id
+        driver_frames.append(driver_df)
 
-                    sector_data = pd.read_parquet(overall_file, storage_options=storage_options)
-                    tel_data = pd.read_parquet(telemetry_file, storage_options=storage_options)
+    if not driver_frames:
+        logging.info(f"Skipping race {race_location} - no driver data prepared")
+        return pd.DataFrame()
 
-                    if weather_data_dict is None and _exists(fs, weather_file):
-                        weather_data = pd.read_parquet(weather_file, storage_options=storage_options)
-                        if "Time" in weather_data.columns:
-                            weather_data["Time"] = _to_seconds(weather_data["Time"])
-                            weather_data = weather_data.dropna(subset=["Time"])
-                            weather_data_dict = weather_data
+    race_df = pd.concat(driver_frames, ignore_index=True, sort=False)
 
-                    if "LapStartTime" not in sector_data.columns or "session_time" not in tel_data.columns:
-                        logging.warning(f"Missing required time columns for {selected_driver}, skipping")
-                        continue
+    race_df = add_race_date(race_df)
 
-                    sector_data["LapStartTime"] = _to_seconds(sector_data["LapStartTime"])
-                    tel_data["session_time"] = _to_seconds(tel_data["session_time"])
+    min_time = race_df["session_time"].min()
+    race_df = race_df[race_df["session_time"] > min_time]
 
-                    tel_keep = [
-                        "session_time", "x", "y", "z", "speed", "gear", "rpm", "drs", "brake", "position"
-                    ]
-                    sector_keep = [
-                        "LapStartTime", "Driver", "DriverNumber", "LapNumber", "PitInTime", "PitOutTime",
-                        "TyreLife", "Compound", "Team", "TrackStatus"
-                    ]
+    logging.info(f"Final silver race shape for {race_location}: {race_df.shape}")
+    return race_df
 
-                    tel_data = tel_data[[c for c in tel_keep if c in tel_data.columns]]
-                    sector_data = sector_data[[c for c in sector_keep if c in sector_data.columns]]
+'''
+Uncomment to write to azure 
+def write_race_output(
+    race_df: pd.DataFrame,
+    race_year: int,
+    race_location: str,
+    silver_container: str,
+    storage_options: dict
+) -> str:
+    safe_location = re.sub(r"[^\w]+", "_", race_location).strip("_")
+    output_file = _abfs_path(
+        silver_container,
+        f"{race_year}/{SESSION_TYPE}/{safe_location}.parquet"
+    )
 
-                    tel_data = tel_data.dropna(subset=["session_time"])
-                    sector_data = sector_data.dropna(subset=["LapStartTime"])
+    race_df.to_parquet(output_file, index=False, storage_options=storage_options)
 
-                    if tel_data.empty or sector_data.empty:
-                        logging.info(f"Skipping {selected_driver} - empty telemetry or laps data")
-                        continue
+    logging.info(f"Saved: {output_file}")
+    return output_file
+'''
 
-                    driver_race_details = pd.merge_asof(
-                        left=tel_data.sort_values("session_time"),
-                        right=sector_data.sort_values("LapStartTime"),
-                        left_on="session_time",
-                        right_on="LapStartTime"
-                    )
+def write_race_output(
+    race_df: pd.DataFrame,
+    race_year: int,
+    race_location: str,
+    silver_container: str,
+    storage_options: dict
+) -> str:
+    safe_location = re.sub(r"[^\w]+", "_", race_location).strip("_")
 
-                    if "LapStartTime" in driver_race_details.columns:
-                        driver_race_details = driver_race_details.drop(columns=["LapStartTime"])
+    local_root = "data/silver"
+    output_dir = os.path.join(local_root, str(race_year), SESSION_TYPE)
+    os.makedirs(output_dir, exist_ok=True)
 
-                    if selected_driver == target_driver:
-                        target_driver_times = driver_race_details[["session_time"]].copy().reset_index(drop=True)
+    output_file = os.path.join(output_dir, f"{safe_location}.parquet")
+    race_df.to_parquet(output_file, index=False)
 
-                    prefix = f"Target_{target_driver}_" if selected_driver == target_driver else f"{selected_driver}_"
-                    driver_race_details = driver_race_details.add_prefix(prefix)
-
-                    if selected_driver == target_driver:
-                        driver_race_details["race_id"] = race_id
-                        driver_race_details["race_year"] = race_year
-                        driver_race_details["race_location"] = race_location
-
-                    driver_race_details = driver_race_details.reset_index(drop=True)
-                    driver_data_dict[selected_driver] = driver_race_details
-
-                    logging.info(f"{selected_driver} data processed")
-
-                except Exception as e:
-                    logging.exception(f"Error processing {selected_driver}: {str(e)}")
-                    continue
-
-            if not driver_data_dict:
-                logging.info(f"No data collected for {race_location} - {race_year}, skipping...")
-                continue
-
-            if target_driver not in driver_data_dict or target_driver_times is None:
-                logging.info(f"Target driver {target_driver} not found for {race_location} - {race_year}, skipping...")
-                continue
-
-            if weather_data_dict is None or weather_data_dict.empty:
-                logging.info(f"No weather data for {race_location} - {race_year}, skipping...")
-                continue
-
-            logging.info(f"Merging data for {len(driver_data_dict)} drivers...")
-
-            race_data = target_driver_times.copy()
-
-            for driver, driver_df in driver_data_dict.items():
-                if driver == target_driver:
-                    prefix = f"Target_{target_driver}_"
-                    target_cols = [col for col in driver_df.columns if col != f"{prefix}session_time"]
-
-                    race_data = pd.merge(
-                        race_data,
-                        driver_df[target_cols],
-                        left_index=True,
-                        right_index=True,
-                        how="left"
-                    )
-
-                    race_data = race_data.sort_values("session_time")
-                    weather_data_sorted = weather_data_dict.sort_values("Time")
-
-                    race_data = pd.merge_asof(
-                        race_data,
-                        weather_data_sorted,
-                        left_on="session_time",
-                        right_on="Time",
-                        direction="nearest"
-                    )
-
-                    if "Time" in race_data.columns:
-                        race_data = race_data.drop(columns=["Time"])
-
-                else:
-                    session_col = f"{driver}_session_time"
-                    if session_col not in driver_df.columns:
-                        continue
-
-                    other_cols = [col for col in driver_df.columns if col != session_col]
-                    temp_df = driver_df[[session_col] + other_cols].copy().sort_values(session_col)
-
-                    race_data = pd.merge_asof(
-                        race_data.sort_values("session_time"),
-                        temp_df,
-                        left_on="session_time",
-                        right_on=session_col,
-                        direction="nearest"
-                    )
-
-                    if session_col in race_data.columns:
-                        race_data = race_data.drop(columns=[session_col])
-
-            logging.info(f"Race data merged: {race_data.shape[0]} rows, {race_data.shape[1]} columns")
-
-            prepared_data = pd.concat([prepared_data, race_data], axis=0, ignore_index=True, sort=False)
-            logging.info(f"Database updated: Total rows = {prepared_data.shape[0]}")
-
-            race_id += 1
-
-    return prepared_data
-
+    logging.info(f"Saved silver locally: {output_file}")
+    return output_file
 
 def run_silver_pipeline(
-    target_driver: str = TARGET_DRIVER,
+    year: Optional[int] = None,
+    session_type: Optional[str] = None,
+    race_location: Optional[str] = None,
     storage_account: Optional[str] = None,
     storage_key: Optional[str] = None,
     bronze_container: Optional[str] = None,
     silver_container: Optional[str] = None
-) -> str:
-    storage_account = storage_account or os.getenv("STORAGE_ACCOUNT_NAME")
-    storage_key = storage_key or os.getenv("STORAGE_ACCOUNT_KEY")
-    bronze_container = bronze_container or os.getenv("BRONZE_CONTAINER", "bronze")
-    silver_container = silver_container or os.getenv("SILVER_CONTAINER", "silver")
+):
+    global SESSION_TYPE
 
-    if not storage_account:
-        raise ValueError("Missing STORAGE_ACCOUNT_NAME")
-    if not storage_key:
-        raise ValueError("Missing STORAGE_ACCOUNT_KEY")
-    if not bronze_container:
-        raise ValueError("Missing BRONZE_CONTAINER")
-    if not silver_container:
-        raise ValueError("Missing SILVER_CONTAINER")
+    # -------- YEARS --------
+    if year:
+        if isinstance(year, list):
+            selected_years = [int(y) for y in year]
+        else:
+            selected_years = [int(y.strip()) for y in str(year).split(",") if y.strip()]
+    else:
+        selected_years = YEARS
 
-    data = load_data_files(
-        target_driver=target_driver,
-        storage_account=storage_account,
-        storage_key=storage_key,
-        bronze_container=bronze_container
-    )
+    # -------- RACES --------
+    if race_location:
+        if isinstance(race_location, list):
+            selected_races = race_location
+        else:
+            selected_races = [r.strip() for r in str(race_location).split(",") if r.strip()]
+    else:
+        selected_races = RACE_LOCATIONS
 
-    if data.empty:
-        raise ValueError(f"No silver data prepared for target_driver={target_driver}")
+    original_session_type = SESSION_TYPE
+    SESSION_TYPE = session_type or SESSION_TYPE
 
     storage_options = get_storage_options(storage_account, storage_key)
-    output_file = _abfs_path(silver_container, f"{target_driver}_silver.parquet")
+    fs = get_filesystem(storage_account, storage_key)
 
-    data.to_parquet(output_file, index=False, storage_options=storage_options)
+    output_files = []
+    race_id = 0
 
-    logging.info("=" * 60)
-    logging.info(f"FINAL DATASET: {data.shape[0]} rows × {data.shape[1]} columns")
-    logging.info("=" * 60)
-    logging.info(f"Saved silver data to: {output_file}")
+    try:
+        for race_year in selected_years:
+            for race in selected_races:
+                try:
+                    race_df = load_race_data(
+                        race_year=race_year,
+                        race_location=race,
+                        race_id=race_id,
+                        bronze_container=bronze_container,
+                        storage_options=storage_options,
+                        fs=fs
+                    )
 
-    return output_file
+                    if race_df.empty:
+                        continue
 
+                    out_file = write_race_output(
+                        race_df=race_df,
+                        race_year=race_year,
+                        race_location=race,
+                        silver_container=silver_container,
+                        storage_options=storage_options
+                    )
+
+                    output_files.append(out_file)
+                    race_id += 1
+
+                    del race_df
+                    gc.collect()
+
+                except Exception as e:
+                    logging.exception(f"Error processing {race} - {race_year}: {e}")
+                    gc.collect()
+                    continue
+
+    finally:
+        SESSION_TYPE = original_session_type
+
+    if not output_files:
+        logging.warning("No silver files created")
+
+    return output_files
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     run_silver_pipeline()
