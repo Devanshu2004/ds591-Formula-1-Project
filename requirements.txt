@@ -11,3 +11,4 @@ certifi
 fsspec
 adlfs
 textblob
+scikit-learn 

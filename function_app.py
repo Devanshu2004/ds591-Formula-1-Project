@@ -28,7 +28,7 @@ def f1_live_process(mytimer: func.TimerRequest) -> None:
 import azure.functions as func
 import logging
 import json
-import os
+import os 
 # from src.live_casting import main as live_casting_main
 # from src.social_media_analysis import run_social_processor
 
@@ -36,22 +36,22 @@ app = func.FunctionApp()
 
 
 # This decorator defines the Timer Trigger (Running every hour)
-@app.timer_trigger(schedule="*/10 * * * * *", arg_name="mytimer", run_on_startup=False)
-def f1_live_process(mytimer: func.TimerRequest) -> None:
-    from src.live_casting import main as live_casting_main
-    if mytimer.past_due:
-        logging.info('The timer is past due!')
+# @app.timer_trigger(schedule="*/10 * * * * *", arg_name="mytimer", run_on_startup=False)
+# def f1_live_process(mytimer: func.TimerRequest) -> None:
+#     from src.live_casting import main as live_casting_main
+#     if mytimer.past_due:
+#         logging.info('The timer is past due!')
 
-    logging.info("Starting F1 Live Telemetry Process...")
+#     logging.info("Starting F1 Live Telemetry Process...")
     
-    try:
-        # Call your existing analytics code here
-        # Example: passing a specific GP or year
-        result = live_casting_main()
-        logging.info(f"Analysis Complete: {result}")
+#     try:
+#         # Call your existing analytics code here
+#         # Example: passing a specific GP or year
+#         result = live_casting_main()
+#         logging.info(f"Analysis Complete: {result}")
         
-    except Exception as e:
-        logging.error(f"Error during F1 Process: {e}")
+#     except Exception as e:
+#         logging.error(f"Error during F1 Process: {e}")
 
 def get_env(name: str, default: str = None, required: bool = False) -> str:
     """
@@ -73,41 +73,41 @@ def json_response(payload: dict, status_code: int = 200) -> func.HttpResponse:
 
 
 # ── LIVE TELEMETRY: EVENT HUB TRIGGER ──────────────────────────────────────────
-@app.event_hub_message_trigger(
-    arg_name="event",
-    event_hub_name="%EVENT_HUB_NAME%",
-    connection="EVENT_HUB_CONNECTION_STRING"
-)
-def f1_live_ingest(event: func.EventHubEvent):
-    """
-    Triggered automatically whenever a message arrives on the Event Hub.
-    Writes raw telemetry to ADLS bronze/live layer.
-    """
-    logging.info("Event Hub trigger fired — new F1 telemetry received")
+# @app.event_hub_message_trigger(
+#     arg_name="event",
+#     event_hub_name="%EVENT_HUB_NAME%",
+#     connection="EVENT_HUB_CONNECTION_STRING"
+# )
+# def f1_live_ingest(event: func.EventHubEvent):
+#     """
+#     Triggered automatically whenever a message arrives on the Event Hub.
+#     Writes raw telemetry to ADLS bronze/live layer.
+#     """
+#     logging.info("Event Hub trigger fired — new F1 telemetry received")
 
-    try:
-        raw = event.get_body().decode("utf-8")
-        logging.info(f"Raw event received, length={len(raw)}")
+#     try:
+#         raw = event.get_body().decode("utf-8")
+#         logging.info(f"Raw event received, length={len(raw)}")
 
-        storage_account = get_env("STORAGE_ACCOUNT_NAME", required=True)
-        storage_key = get_env("STORAGE_ACCOUNT_KEY", required=True)
-        container = get_env("ADLS_CONTAINER", required=True)
-        directory = get_env("ADLS_DIRECTORY", required=True)
+#         storage_account = get_env("STORAGE_ACCOUNT_NAME", required=True)
+#         storage_key = get_env("STORAGE_ACCOUNT_KEY", required=True)
+#         container = get_env("ADLS_CONTAINER", required=True)
+#         directory = get_env("ADLS_DIRECTORY", required=True)
 
-        from src.fetch_data import store_bronze
-        store_bronze(
-            raw_data=raw,
-            storage_account=storage_account,
-            storage_key=storage_key,
-            container=container,
-            directory=directory
-        )
+#         from src.fetch_data import store_bronze
+#         store_bronze(
+#             raw_data=raw,
+#             storage_account=storage_account,
+#             storage_key=storage_key,
+#             container=container,
+#             directory=directory
+#         )
 
-        logging.info("Bronze layer write successful")
+#         logging.info("Bronze layer write successful")
 
-    except Exception as e:
-        logging.exception(f"Live ingest failed: {e}")
-        raise
+#     except Exception as e:
+#         logging.exception(f"Live ingest failed: {e}")
+#         raise
 
 
 # ── LIVE TRANSMISSION: HTTP TRIGGER ────────────────────────────────────────────
@@ -175,23 +175,29 @@ def run_live(req: func.HttpRequest) -> func.HttpResponse:
 # ── HISTORICAL: SILVER ─────────────────────────────────────────────────────────
 @app.route(route="run_silver", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def run_silver(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Runs the silver processing pipeline.
-    POST /api/run_silver?target_driver=VER
-    """
     logging.info("Silver pipeline triggered")
 
     try:
-        driver = req.params.get("target_driver", get_env("TARGET_DRIVER", "LEC"))
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = {}
+
+        year = req.params.get("year") or body.get("year")
+        session_type = req.params.get("session_type") or body.get("session_type")
+        race_location = req.params.get("race_location") or body.get("race_location")
 
         storage_account = get_env("STORAGE_ACCOUNT_NAME", required=True)
         storage_key = get_env("STORAGE_ACCOUNT_KEY", required=True)
-        bronze_container = get_env("BRONZE_CONTAINER", required=True)
-        silver_container = get_env("SILVER_CONTAINER", required=True)
+        bronze_container = "bronze"
+        silver_container = "silver"
 
         from src.silver import run_silver_pipeline
+
         output_path = run_silver_pipeline(
-            target_driver=driver,
+            year=year,                         # can be single, comma string, or list
+            session_type=session_type,
+            race_location=race_location,       # can be single, comma string, or list
             storage_account=storage_account,
             storage_key=storage_key,
             bronze_container=bronze_container,
@@ -201,7 +207,11 @@ def run_silver(req: func.HttpRequest) -> func.HttpResponse:
         return json_response({
             "status": "success",
             "message": "Silver pipeline completed",
-            "driver": driver,
+            "input": {
+                "year": year,
+                "session_type": session_type,
+                "race_location": race_location
+            },
             "output_path": output_path
         }, 200)
 
