@@ -1,3 +1,844 @@
-# This file channelizes all the input data
-# from 3 major sources and trains a model for
-# future prediction.
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+import logging
+import fsspec
+from typing import Optional, Dict, List, Tuple
+
+# ── Global Constants ───────────────────────────────────────────
+
+RACE_LOCATIONS = [
+    "Italian Grand Prix", "Azerbaijan Grand Prix", "Singapore Grand Prix",
+    "Mexico City Grand Prix", "Brazilian Grand Prix", "Las Vegas Grand Prix",
+    "Qatar Grand Prix", "Abu Dhabi Grand Prix", "United States Grand Prix",
+    "Australian Grand Prix", "Austrian Grand Prix", "Bahrain Grand Prix",
+    "Belgian Grand Prix", "British Grand Prix", "Canadian Grand Prix",
+    "Chinese Grand Prix", "Dutch Grand Prix", "Eifel Grand Prix",
+    "Emilia Romagna Grand Prix", "French Grand Prix", "German Grand Prix",
+    "Hungarian Grand Prix", "Japanese Grand Prix", "Miami Grand Prix",
+    "Monaco Grand Prix", "Portuguese Grand Prix", "Russian Grand Prix",
+    "Sakhir Grand Prix", "Saudi Arabian Grand Prix", "Spanish Grand Prix",
+    "Styrian Grand Prix", "São Paulo Grand Prix", "Turkish Grand Prix",
+    "Tuscan Grand Prix"
+]
+
+DRIVER_ABB = {
+    "ALB": ["Alexander Albon", "Alex Albon"],
+    "ALO": ["Fernando Alonso"],
+    "ANT": ["Kimi Antonelli"],
+    "BEA": ["Oliver Bearman"],
+    "BOR": ["Gabriel Bortoleto"],
+    "BOT": ["Valtteri Bottas"],
+    "COL": ["Franco Colapinto"],
+    "DEV": ["Nyck De Vries"],
+    "DOO": ["Jack Doohan"],
+    "ERI": ["Marcus Ericsson"],
+    "FIT": ["Pietro Fittipaldi"],
+    "GAS": ["Pierre Gasly"],
+    "GIO": ["Antonio Giovinazzi"],
+    "GRO": ["Romain Grosjean"],
+    "HAD": ["Isack Hadjar"],
+    "HAM": ["Lewis Hamilton"],
+    "HAR": ["Brendon Hartley"],
+    "HUL": ["Nico Hülkenberg"],
+    "KUB": ["Robert Kubica"],
+    "KVY": ["Daniil Kvyat"],
+    "LAT": ["Nicholas Latifi"],
+    "LAW": ["Liam Lawson"],
+    "LEC": ["Charles Leclerc"],
+    "MAG": ["Kevin Magnussen"],
+    "MSC": ["Mick Schumacher"],
+    "MAZ": ["Nikita Mazepin"],
+    "NOR": ["Lando Norris"],
+    "OCO": ["Esteban Ocon"],
+    "PER": ["Sergio Perez"],
+    "PIA": ["Oscar Piastri"],
+    "RAI": ["Kimi Räikkönen"],
+    "RIC": ["Daniel Ricciardo"],
+    "RUS": ["George Russell"],
+    "SAI": ["Carlos Sainz", "Carlos Sainz Jr."],
+    "SAR": ["Logan Sargeant"],
+    "SIR": ["Sergey Sirotkin"],
+    "STR": ["Lance Stroll"],
+    "TSU": ["Yuki Tsunoda"],
+    "VAN": ["Stoffel Vandoorne"],
+    "VER": ["Max Verstappen"],
+    "VET": ["Sebastian Vettel"],
+    "ZHO": ["Zhou Guanyu"]
+}
+
+DRIVER_LIST = list(DRIVER_ABB.keys())
+
+
+# ── Configuration ──────────────────────────────────────────────
+
+SAMPLING_RATE      = 0.1
+WINDOW_SECONDS     = 30
+HORIZON_SECONDS    = 300
+
+SEQUENCE_LENGTH    = int(WINDOW_SECONDS  / SAMPLING_RATE)   # 300
+PREDICTION_HORIZON = int(HORIZON_SECONDS / SAMPLING_RATE)   # 3000
+
+LSTM_HIDDEN_SIZE   = 64
+LSTM_LAYERS        = 2
+EMBEDDING_DIM      = 32
+DROPOUT            = 0.3
+BATCH_SIZE         = 32
+EPOCHS             = 50
+LEARNING_RATE      = 1e-3
+NUM_POSITIONS      = 20
+
+SESSION_TYPE       = os.getenv("SESSION_TYPE", "R")
+
+
+# ── Azure Storage Configuration ────────────────────────────────
+
+STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME", "formula1analyticsdata")
+STORAGE_ACCOUNT_KEY  = os.getenv("STORAGE_ACCOUNT_KEY")
+GOLD_CONTAINER       = os.getenv("GOLD_CONTAINER",  "gold")
+MODEL_CONTAINER      = os.getenv("MODEL_CONTAINER", "platinum")
+
+
+def get_storage_options() -> Dict:
+    return {
+        "account_name": STORAGE_ACCOUNT_NAME,
+        "account_key":  STORAGE_ACCOUNT_KEY,
+    }
+
+
+def get_fs() -> fsspec.AbstractFileSystem:
+    return fsspec.filesystem(
+        "abfs",
+        account_name=STORAGE_ACCOUNT_NAME,
+        account_key=STORAGE_ACCOUNT_KEY,
+    )
+
+
+def abfs_path(container: str, path: str) -> str:
+    return (
+        f"abfs://{container}"
+        f"@{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net/{path}"
+    )
+
+
+def blob_path(container: str, path: str) -> str:
+    """
+    Returns the bare container/path string used by fsspec
+    (without the abfs:// scheme prefix).
+    """
+    return f"{container}/{path}"
+
+
+# ── Column Definitions ─────────────────────────────────────────
+
+TARGET_COL       = "target_pos"
+SOCIAL_SCORE_COL = "target_driver_social_score"
+SESSION_TIME_COL = "session_time"
+RACE_GROUP_COLS  = ["race_id", "race_year", "race_location"]
+
+DROP_COLS = {
+    "target_driver",
+    "driver_ahead",
+    "driver_behind",
+    "target_rpm",
+    "driver_ahead_rpm",
+    "driver_behind_rpm",
+    "race_date",
+}
+
+META_COLS = {
+    SESSION_TIME_COL,
+    "race_id",
+    "race_date",
+    "race_year",
+    "race_location",
+    TARGET_COL,
+    SOCIAL_SCORE_COL,
+}
+
+RADIO_COLS = [
+    "primary_event_type_pit_call",
+    "primary_event_type_damage_issue",
+    "primary_event_type_mechanical_issue",
+    "primary_event_type_safety",
+    "primary_event_type_weather",
+    "primary_event_type_tire_strategy",
+    "primary_event_type_pace_management",
+    "primary_event_type_overtaking",
+    "primary_event_type_defending",
+    "primary_event_type_traffic",
+    "primary_event_type_celebration",
+    "primary_event_type_information_only",
+    "secondary_event_type_pit_call",
+    "secondary_event_type_damage_issue",
+    "secondary_event_type_mechanical_issue",
+    "secondary_event_type_safety",
+    "secondary_event_type_weather",
+    "secondary_event_type_tire_strategy",
+    "secondary_event_type_pace_management",
+    "secondary_event_type_overtaking",
+    "secondary_event_type_defending",
+    "secondary_event_type_traffic",
+    "secondary_event_type_celebration",
+    "secondary_event_type_information_only",
+    "urgency_low",
+    "urgency_medium",
+    "urgency_high",
+    "sentiment_positive",
+    "sentiment_negative",
+    "sentiment_urgent",
+    "sentiment_neutral",
+    "action_pit_now",
+    "action_pit_soon",
+    "action_stay_out",
+    "action_push",
+    "action_conserve",
+    "action_manage_tires",
+    "action_defend",
+    "action_overtake",
+    "action_report_issue",
+    "action_acknowledge_info",
+    "action_unknown",
+    "issue_none",
+    "issue_wing_damage",
+    "issue_floor_damage",
+    "issue_engine",
+    "issue_brakes",
+    "issue_gearbox",
+    "issue_battery",
+    "issue_overheating",
+    "issue_steering",
+    "issue_unknown",
+    "severity_none",
+    "severity_minor",
+    "severity_moderate",
+    "action_required",
+    "strategy_pit_related",
+    "strategy_tire_related",
+    "strategy_fuel_saving",
+    "strategy_pace_change",
+    "strategy_weather_related",
+    "strategy_safety_related",
+    "car_has_issue",
+    "racecraft_traffic_mentioned",
+    "racecraft_overtake_mentioned",
+    "racecraft_defend_mentioned",
+    "racecraft_drs_mentioned",
+    "racecraft_gap_management_mentioned",
+]
+
+
+# ── Azure Data Loader ──────────────────────────────────────────
+
+def load_driver_parquet(driver: str) -> Optional[pd.DataFrame]:
+    """
+    Load driver gold parquet from Azure.
+    Path: gold/{SESSION_TYPE}/{driver}_gold.parquet
+    """
+    path = abfs_path(
+        GOLD_CONTAINER,
+        f"{SESSION_TYPE}/{driver}_gold.parquet"
+    )
+    try:
+        df = pd.read_parquet(path, storage_options=get_storage_options())
+        logging.info(f"Loaded {driver}: {df.shape[0]} rows")
+        return df
+    except Exception as e:
+        logging.warning(f"Could not load {driver}: {e}")
+        return None
+
+
+def save_model_to_azure(local_path: str, blob_name: str):
+    """
+    Upload local model file to platinum container.
+    Structure: platinum/models/{filename}
+    """
+    try:
+        fs         = get_fs()
+        remote     = blob_path(MODEL_CONTAINER, blob_name)
+        fs.put(local_path, remote)
+        logging.info(f"Uploaded to Azure: {MODEL_CONTAINER}/{blob_name}")
+    except Exception as e:
+        logging.warning(f"Could not upload {blob_name}: {e}")
+
+
+def load_model_from_azure(blob_name: str, local_path: str):
+    """
+    Download model file from platinum container to local disk.
+    Structure: platinum/models/{filename}
+    """
+    try:
+        fs     = get_fs()
+        remote = blob_path(MODEL_CONTAINER, blob_name)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        fs.get(remote, local_path)
+        logging.info(f"Downloaded from Azure: {MODEL_CONTAINER}/{blob_name}")
+    except Exception as e:
+        logging.warning(f"Could not download {blob_name}: {e}")
+
+
+# ── Dataset ────────────────────────────────────────────────────
+
+class DriverDataset(Dataset):
+    """
+    Builds sequences from a driver's gold DataFrame.
+    All features assumed numerical and ready — no preprocessing.
+
+    DataFrame must contain:
+        - TARGET_COL        : target_pos (1-20)
+        - SOCIAL_SCORE_COL  : static float per race
+        - SESSION_TIME_COL  : float seconds, for sorting
+        - RACE_GROUP_COLS   : race_id, race_year, race_location
+        - RADIO_COLS        : 0.0 when no event at that timestep
+        - All other cols    : main Bi-LSTM features
+
+    Sliding window:
+        - Group by (race_id, race_year, race_location)
+        - Sort by session_time within each race
+        - Window = SEQUENCE_LENGTH = 300 timesteps (30 seconds)
+        - Target = position at timestep
+                   i + SEQUENCE_LENGTH + PREDICTION_HORIZON - 1
+                   (5 minutes = 3000 timesteps ahead)
+    """
+
+    def __init__(self, df: pd.DataFrame):
+        drop      = DROP_COLS | META_COLS
+        df_clean  = df.drop(columns=[c for c in drop if c in df.columns])
+
+        present_radio     = [c for c in RADIO_COLS if c in df_clean.columns]
+        radio_set         = set(present_radio)
+        self.feature_cols = sorted([
+            c for c in df_clean.columns if c not in radio_set
+        ])
+        self.radio_cols   = present_radio
+
+        self.sequences       = []
+        self.targets         = []
+        self.social_scores   = []
+        self.radio_sequences = []
+
+        group_keys = [c for c in RACE_GROUP_COLS if c in df.columns]
+
+        for _, race_df in df.groupby(group_keys):
+            race_df   = race_df.sort_values(SESSION_TIME_COL).reset_index(drop=True)
+            features  = race_df[self.feature_cols].fillna(0).values.astype(np.float32)
+            positions = race_df[TARGET_COL].values.astype(np.float32)
+            social    = float(race_df[SOCIAL_SCORE_COL].iloc[0])
+
+            radio = (
+                race_df[present_radio].fillna(0).values.astype(np.float32)
+                if present_radio
+                else np.zeros((len(race_df), 1), dtype=np.float32)
+            )
+
+            n            = len(features)
+            min_required = SEQUENCE_LENGTH + PREDICTION_HORIZON
+
+            if n < min_required:
+                logging.warning(
+                    f"Race {race_df[group_keys].iloc[0].to_dict()} "
+                    f"has {n} timesteps (need {min_required}) — skipping"
+                )
+                continue
+
+            for i in range(n - SEQUENCE_LENGTH - PREDICTION_HORIZON + 1):
+                target_idx = i + SEQUENCE_LENGTH + PREDICTION_HORIZON - 1
+                target     = positions[target_idx]
+
+                if np.isnan(target) or target < 1 or target > NUM_POSITIONS:
+                    continue
+
+                self.sequences.append(features[i: i + SEQUENCE_LENGTH])
+                self.targets.append(int(target) - 1)
+                self.social_scores.append(social)
+                self.radio_sequences.append(radio[i: i + SEQUENCE_LENGTH])
+
+        logging.info(
+            f"Dataset: {len(self.sequences)} sequences | "
+            f"input_size={len(self.feature_cols)} | "
+            f"radio_dim={len(self.radio_cols) or 1}"
+        )
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.sequences[idx]),
+            torch.tensor(self.targets[idx],       dtype=torch.long),
+            torch.tensor(self.social_scores[idx], dtype=torch.float32),
+            torch.tensor(self.radio_sequences[idx]),
+        )
+
+
+# ── Radio Attention ────────────────────────────────────────────
+
+class RadioAttention(nn.Module):
+    """
+    Sparse attention gate for radio events.
+    Silent timesteps pass through unchanged.
+    Active timesteps are modulated by radio content.
+    """
+
+    def __init__(self, hidden_size: int, radio_dim: int):
+        super().__init__()
+        self.radio_proj = nn.Linear(radio_dim, hidden_size * 2)
+        self.gate       = nn.Linear(hidden_size * 2, 1)
+        self.sigmoid    = nn.Sigmoid()
+
+    def forward(
+        self,
+        lstm_out: torch.Tensor,  # (batch, seq_len, hidden*2)
+        radio:    torch.Tensor,  # (batch, seq_len, radio_dim)
+    ) -> torch.Tensor:
+        has_event = (radio.abs().sum(dim=-1, keepdim=True) > 0).float()
+        proj      = torch.tanh(self.radio_proj(radio))
+        gate      = self.sigmoid(self.gate(lstm_out + proj))
+        return lstm_out + (gate * proj * has_event)
+
+
+# ── Driver Channel (Bi-LSTM) ───────────────────────────────────
+
+class DriverChannel(nn.Module):
+    """
+    Bi-LSTM channel for a single driver.
+
+    Forward returns:
+        embedding : (batch, EMBEDDING_DIM)  →  Random Forest input
+        logits    : (batch, NUM_POSITIONS)  →  channel training loss
+    """
+
+    def __init__(self, input_size: int, radio_dim: int):
+        super().__init__()
+
+        self.bilstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=LSTM_HIDDEN_SIZE,
+            num_layers=LSTM_LAYERS,
+            batch_first=True,
+            bidirectional=True,
+            dropout=DROPOUT if LSTM_LAYERS > 1 else 0.0,
+        )
+
+        self.radio_attention = RadioAttention(LSTM_HIDDEN_SIZE, radio_dim)
+        self.social_proj     = nn.Linear(1, LSTM_HIDDEN_SIZE * 2)
+        self.dropout         = nn.Dropout(DROPOUT)
+
+        self.embedding_proj = nn.Sequential(
+            nn.Linear(LSTM_HIDDEN_SIZE * 2, EMBEDDING_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT),
+        )
+
+        self.classifier = nn.Linear(EMBEDDING_DIM, NUM_POSITIONS)
+
+    def forward(
+        self,
+        x:      torch.Tensor,  # (batch, seq_len, input_size)
+        social: torch.Tensor,  # (batch,)
+        radio:  torch.Tensor,  # (batch, seq_len, radio_dim)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        lstm_out, _ = self.bilstm(x)
+        lstm_out    = self.radio_attention(lstm_out, radio)
+        last        = lstm_out[:, -1, :]
+        last        = last + torch.tanh(self.social_proj(social.unsqueeze(-1)))
+        last        = self.dropout(last)
+        emb         = self.embedding_proj(last)
+        logits      = self.classifier(emb)
+
+        return emb, logits
+
+
+# ── Train One Driver Channel ───────────────────────────────────
+
+def train_driver_channel(
+    driver:   str,
+    save_dir: str,
+    device:   torch.device,
+) -> bool:
+    """
+    Load driver data from Azure gold container,
+    train Bi-LSTM channel, save weights locally and
+    upload to platinum/models/{driver}.pt on Azure.
+    """
+    logging.info(f"Training channel: {driver}")
+
+    df = load_driver_parquet(driver)
+    if df is None or df.empty:
+        logging.warning(f"No data for {driver} — skipping")
+        return False
+
+    dataset = DriverDataset(df)
+    if len(dataset) == 0:
+        logging.warning(f"No sequences for {driver} — skipping")
+        return False
+
+    input_size = len(dataset.feature_cols)
+    radio_dim  = len(dataset.radio_cols) if dataset.radio_cols else 1
+
+    loader    = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    model     = DriverChannel(input_size, radio_dim).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=20, gamma=0.5
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(EPOCHS):
+        total_loss = 0.0
+        for x_b, y_b, s_b, r_b in loader:
+            x_b = x_b.to(device)
+            y_b = y_b.to(device)
+            s_b = s_b.to(device)
+            r_b = r_b.to(device)
+
+            optimizer.zero_grad()
+            _, logits = model(x_b, s_b, r_b)
+            loss      = criterion(logits, y_b)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        if (epoch + 1) % 10 == 0:
+            logging.info(
+                f"  [{driver}] Epoch {epoch + 1}/{EPOCHS}  "
+                f"Loss: {total_loss / len(loader):.4f}"
+            )
+
+    # Save locally
+    os.makedirs(save_dir, exist_ok=True)
+    local_path = os.path.join(save_dir, f"channel_{driver}.pt")
+    torch.save(
+        {
+            "state_dict":   model.state_dict(),
+            "input_size":   input_size,
+            "radio_dim":    radio_dim,
+            "feature_cols": dataset.feature_cols,
+            "radio_cols":   dataset.radio_cols,
+        },
+        local_path,
+    )
+    logging.info(f"Saved locally: {local_path}")
+
+    # Upload to platinum/models/channel_{driver}.pt
+    save_model_to_azure(local_path, f"models/channel_{driver}.pt")
+
+    return True
+
+
+# ── Train All Driver Channels ──────────────────────────────────
+
+def train_all_channels(
+    save_dir: str,
+    device:   torch.device,
+):
+    """
+    Train all driver channels using DRIVER_LIST from DRIVER_ABB.
+    Loads each driver's gold parquet from Azure gold container.
+    Saves each channel to platinum/models/channel_{driver}.pt
+    """
+    trained, skipped = [], []
+
+    for driver in DRIVER_LIST:
+        success = train_driver_channel(driver, save_dir, device)
+        if success:
+            trained.append(driver)
+        else:
+            skipped.append(driver)
+
+    logging.info(f"Trained : {trained}")
+    logging.info(f"Skipped : {skipped}")
+
+
+# ── Extract Embeddings for RF ──────────────────────────────────
+
+def extract_embeddings(
+    save_dir: str,
+    device:   torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load each saved channel, extract embeddings over full dataset,
+    align to minimum sample count, concatenate into RF input matrix.
+
+    Row i of X = [emb_driver1[i], ..., emb_driverN[i]]
+    y[i]        = target position (0-indexed) from first available driver
+    """
+    all_embeddings: Dict[str, np.ndarray] = {}
+    all_targets:    Dict[str, np.ndarray] = {}
+
+    for driver in DRIVER_LIST:
+        local_path = os.path.join(save_dir, f"channel_{driver}.pt")
+
+        # Try downloading from Azure if not available locally
+        if not os.path.exists(local_path):
+            load_model_from_azure(
+                f"models/channel_{driver}.pt",
+                local_path,
+            )
+
+        if not os.path.exists(local_path):
+            logging.warning(f"Skipping {driver} — no saved channel")
+            continue
+
+        df = load_driver_parquet(driver)
+        if df is None or df.empty:
+            logging.warning(f"Skipping {driver} — no data")
+            continue
+
+        ckpt  = torch.load(local_path, map_location=device)
+        model = DriverChannel(
+            input_size=ckpt["input_size"],
+            radio_dim=ckpt["radio_dim"],
+        ).to(device)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+
+        dataset = DriverDataset(df)
+        if len(dataset) == 0:
+            continue
+
+        loader     = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+        embs, tgts = [], []
+
+        with torch.no_grad():
+            for x_b, y_b, s_b, r_b in loader:
+                emb, _ = model(
+                    x_b.to(device),
+                    s_b.to(device),
+                    r_b.to(device),
+                )
+                embs.append(emb.cpu().numpy())
+                tgts.append(y_b.numpy())
+
+        all_embeddings[driver] = np.concatenate(embs, axis=0)
+        all_targets[driver]    = np.concatenate(tgts, axis=0)
+        logging.info(
+            f"{driver}: {all_embeddings[driver].shape[0]} embeddings extracted"
+        )
+
+    if not all_embeddings:
+        raise ValueError(
+            "No embeddings extracted — check gold container and saved channels"
+        )
+
+    min_n        = min(e.shape[0] for e in all_embeddings.values())
+    first_driver = next(iter(all_targets))
+    logging.info(f"Aligning RF matrix to {min_n} samples")
+
+    X_rows, y_rows = [], []
+    for i in range(min_n):
+        row = [
+            all_embeddings[d][i] if d in all_embeddings
+            else np.zeros(EMBEDDING_DIM, dtype=np.float32)
+            for d in DRIVER_LIST
+        ]
+        X_rows.append(np.concatenate(row))
+        y_rows.append(all_targets[first_driver][i])
+
+    X = np.array(X_rows, dtype=np.float32)
+    y = np.array(y_rows, dtype=np.int64)
+
+    logging.info(f"RF input  : {X.shape}")
+    logging.info(f"RF targets: {y.shape}")
+    return X, y
+
+
+# ── Train Random Forest ────────────────────────────────────────
+
+def train_random_forest(
+    save_dir: str,
+    device:   torch.device,
+) -> RandomForestClassifier:
+    """
+    Extract embeddings from all saved channels and train RF.
+    Saves RF locally and uploads to platinum/models/random_forest.joblib
+    """
+    logging.info("Extracting embeddings for RF training...")
+    X, y = extract_embeddings(save_dir, device)
+
+    logging.info("Training Random Forest...")
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=15,
+        class_weight="balanced",
+        n_jobs=-1,
+        random_state=42,
+    )
+    rf.fit(X, y)
+
+    # Save locally
+    local_rf = os.path.join(save_dir, "random_forest.joblib")
+    joblib.dump(rf, local_rf)
+    logging.info(f"Random Forest saved locally: {local_rf}")
+
+    # Upload to platinum/models/random_forest.joblib
+    save_model_to_azure(local_rf, "models/random_forest.joblib")
+
+    return rf
+
+
+# ── Load Channel ───────────────────────────────────────────────
+
+def load_channel(
+    driver:   str,
+    save_dir: str,
+    device:   torch.device,
+) -> Optional[Tuple[DriverChannel, Dict]]:
+    """
+    Load a saved driver channel.
+    Tries local first, downloads from platinum/models/ if missing.
+    """
+    local_path = os.path.join(save_dir, f"channel_{driver}.pt")
+
+    if not os.path.exists(local_path):
+        load_model_from_azure(
+            f"models/channel_{driver}.pt",
+            local_path,
+        )
+
+    if not os.path.exists(local_path):
+        logging.warning(f"No saved channel for {driver}")
+        return None
+
+    ckpt  = torch.load(local_path, map_location=device)
+    model = DriverChannel(
+        input_size=ckpt["input_size"],
+        radio_dim=ckpt["radio_dim"],
+    ).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    return model, ckpt
+
+
+# ── Inference ──────────────────────────────────────────────────
+
+def predict(
+    live_data: Dict[str, Dict],
+    save_dir:  str,
+    device:    torch.device,
+) -> Dict[int, float]:
+    """
+    Run live inference for one race snapshot.
+
+    live_data format:
+    {
+        "LEC": {
+            "features":     np.ndarray shape (SEQUENCE_LENGTH, input_size),
+            "social_score": float,
+            "radio":        np.ndarray shape (SEQUENCE_LENGTH, radio_dim),
+        },
+        "VER": { ... },
+        ...
+    }
+
+    - Driver keys must match DRIVER_ABB keys (e.g. "LEC", "VER")
+    - SEQUENCE_LENGTH = 300 timesteps = 30 seconds at 0.1s resolution
+    - Missing drivers are zero-padded in the RF input
+    - Models loaded from local save_dir or downloaded from
+      platinum/models/ on Azure if not found locally
+
+    Returns:
+    {
+        1:  0.42,   # P1 probability 5 minutes from now
+        2:  0.31,
+        ...
+        20: 0.01,
+    }
+    """
+    local_rf = os.path.join(save_dir, "random_forest.joblib")
+
+    if not os.path.exists(local_rf):
+        load_model_from_azure("models/random_forest.joblib", local_rf)
+
+    if not os.path.exists(local_rf):
+        raise FileNotFoundError(
+            "Random Forest not found locally or in platinum/models/ on Azure."
+        )
+
+    rf  = joblib.load(local_rf)
+    row = []
+
+    for driver in DRIVER_LIST:
+        if driver in live_data:
+            result = load_channel(driver, save_dir, device)
+            if result is not None:
+                model, _ = result
+                d = live_data[driver]
+
+                x = torch.tensor(
+                    d["features"], dtype=torch.float32
+                ).unsqueeze(0).to(device)
+                # (1, SEQUENCE_LENGTH, input_size)
+
+                s = torch.tensor(
+                    [d["social_score"]], dtype=torch.float32
+                ).to(device)
+                # (1,)
+
+                r = torch.tensor(
+                    d["radio"], dtype=torch.float32
+                ).unsqueeze(0).to(device)
+                # (1, SEQUENCE_LENGTH, radio_dim)
+
+                with torch.no_grad():
+                    emb, _ = model(x, s, r)
+                row.append(emb.cpu().numpy().squeeze())
+            else:
+                row.append(np.zeros(EMBEDDING_DIM, dtype=np.float32))
+        else:
+            row.append(np.zeros(EMBEDDING_DIM, dtype=np.float32))
+
+    X       = np.concatenate(row).reshape(1, -1)
+    probs   = rf.predict_proba(X)[0]
+    classes = rf.classes_
+
+    return {
+        int(cls) + 1: round(float(p), 4)
+        for cls, p in zip(classes, probs)
+    }
+
+
+# ── Entry Point ────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    SAVE_DIR = "./model_weights"
+    DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    logging.info(f"Device             : {DEVICE}")
+    logging.info(f"Session type       : {SESSION_TYPE}")
+    logging.info(f"Sequence length    : {SEQUENCE_LENGTH} timesteps ({WINDOW_SECONDS}s)")
+    logging.info(f"Prediction horizon : {PREDICTION_HORIZON} timesteps ({HORIZON_SECONDS}s / 5 min)")
+    logging.info(f"Drivers            : {len(DRIVER_LIST)}")
+    logging.info(f"Gold container     : {GOLD_CONTAINER}")
+    logging.info(f"Model container    : {MODEL_CONTAINER}")
+    logging.info(f"Model path pattern : {MODEL_CONTAINER}/models/channel_{{DRIVER}}.pt")
+
+    # ── Step 1: Train all driver Bi-LSTM channels ───────────────
+    logging.info("=" * 60)
+    logging.info("STEP 1: Training Driver Channels")
+    logging.info("=" * 60)
+    train_all_channels(SAVE_DIR, DEVICE)
+
+    # ── Step 2: Train Random Forest on frozen embeddings ────────
+    logging.info("=" * 60)
+    logging.info("STEP 2: Training Random Forest")
+    logging.info("=" * 60)
+    train_random_forest(SAVE_DIR, DEVICE)
+
+    logging.info("=" * 60)
+    logging.info("Training Complete")
+    logging.info("=" * 60)

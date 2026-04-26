@@ -378,3 +378,68 @@ def run_social_media_pipeline(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=500
         )
+
+# ── MODEL: TRAIN ───────────────────────────────────────────────────────────────
+@app.route(route="run_model", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def run_model(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Trains the F1 race prediction model on historic gold data.
+    Called right after run_gold in the ADF pipeline.
+
+    Pipeline order:
+        run_radio_bronze
+               ↓
+        run_silver | run_radio_silver | process_social  (parallel)
+               ↓
+            run_gold
+               ↓
+            run_model  ← this function
+
+    What it does:
+        1. Loads gold parquet for all drivers from Azure gold container
+        2. Trains one Bi-LSTM channel per driver
+        3. Extracts embeddings from all channels
+        4. Trains Random Forest aggregator
+        5. Saves all models to platinum/models/ on Azure
+
+    Saved artifacts:
+        platinum/models/channel_{DRIVER}.pt     (one per driver)
+        platinum/models/random_forest.joblib
+
+    POST /api/run_model
+    No request body required.
+    """
+    logging.info("run_model HTTP trigger fired — historic training pipeline")
+
+    try:
+        import torch
+        from src.model import train_all_channels, train_random_forest
+
+        save_dir = "/tmp/model_weights"
+        device   = torch.device("cpu")
+
+        logging.info("Step 1: Training driver channels...")
+        train_all_channels(save_dir, device)
+
+        logging.info("Step 2: Training Random Forest on frozen embeddings...")
+        train_random_forest(save_dir, device)
+
+        return json_response({
+            "status":  "success",
+            "message": "Historic model training complete",
+            "artifacts": {
+                "driver_channels": "platinum/models/channel_{DRIVER}.pt",
+                "random_forest":   "platinum/models/random_forest.joblib",
+            },
+            "config": {
+                "sequence_length_timesteps":    300,
+                "sequence_length_seconds":      30,
+                "prediction_horizon_timesteps": 3000,
+                "prediction_horizon_seconds":   300,
+                "sampling_rate":                0.1,
+            }
+        }, 200)
+
+    except Exception as e:
+        logging.exception(f"run_model failed: {e}")
+        return json_response({"status": "error", "message": str(e)}, 500)

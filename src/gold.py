@@ -38,6 +38,14 @@ def _get_silver_file(race_year: int, race_location: str) -> Path:
     print(SILVER_PATH / str(race_year) / SESSION_TYPE / f"{safe_location}.parquet")
     return SILVER_PATH / str(race_year) / SESSION_TYPE / f"{safe_location}.parquet"
 
+def _get_social_file():
+    file_name = "social_media_silver.json"
+    print(SILVER_PATH / f"{file_name}")
+    return SILVER_PATH / f"{file_name}"
+
+def _get_radio_file():
+    ... # TBD
+
 def preprocess_race_df(df: pd.DataFrame, target_driver: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -403,6 +411,207 @@ def feature_engineering(gold_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def _add_social_info(gold_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Joins the social media life_score from social_media_silver.json onto the gold DataFrame.
+
+    The JSON is structured as:
+        { "Status": "...", "<year>": { "<month>": { "<driver_abb>": <score> } } }
+
+    Matching logic:
+        - year  = gold_df["race_year"]  (integer, e.g. 2026)
+        - month = calendar month of gold_df["race_date"]
+        - driver = gold_df["target_driver"]  (3-letter abbreviation, e.g. "LEC")
+
+    If no matching score exists the column is left as NaN so the rest of the
+    pipeline can decide how to handle missing values.
+    """
+    social_file = _get_social_file()
+
+    if not social_file.exists():
+        logging.warning(f"Social media silver file not found at {social_file}. Skipping social join.")
+        gold_df["social_life_score"] = float("nan")
+        return gold_df
+
+    import json
+    with open(social_file, "r") as f:
+        social_data = json.load(f)
+
+    # Flatten the nested dict into a lookup: (year_str, month_str, driver_abb) -> score
+    social_lookup: dict = {}
+    for year_key, months in social_data.items():
+        if year_key == "Status":
+            continue
+        if not isinstance(months, dict):
+            continue
+        for month_key, drivers in months.items():
+            if not isinstance(drivers, dict):
+                continue
+            for driver_abb, score in drivers.items():
+                social_lookup[(str(year_key), str(month_key), driver_abb)] = score
+
+    if gold_df.empty:
+        gold_df["social_life_score"] = float("nan")
+        return gold_df
+
+    # Derive year and month from race_date (fall back to race_year if race_date missing)
+    if "race_date" in gold_df.columns:
+        race_dates = pd.to_datetime(gold_df["race_date"], errors="coerce")
+        year_series  = race_dates.dt.year.fillna(gold_df.get("race_year", pd.Series(dtype=float))).astype("Int64").astype(str)
+        month_series = race_dates.dt.month.astype("Int64").astype(str)
+    else:
+        year_series  = gold_df["race_year"].astype(str)
+        # No race_date column: month cannot be determined — all scores will be NaN
+        month_series = pd.Series([""] * len(gold_df), index=gold_df.index)
+
+    # Derive the driver abbreviation from target_driver column
+    driver_series = gold_df["target_driver"].astype(str).str.upper()
+
+    gold_df["social_life_score"] = [
+        social_lookup.get((y, m, d), float("nan"))
+        for y, m, d in zip(year_series, month_series, driver_series)
+    ]
+
+    matched = gold_df["social_life_score"].notna().sum()
+    logging.info(
+        f"Social media join complete: {matched}/{len(gold_df)} rows matched "
+        f"({matched/len(gold_df)*100:.1f}%)"
+    )
+
+    return gold_df
+
+
+def _add_radio_info(gold_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Joins radio features from the radio silver parquet onto the gold DataFrame.
+
+    The radio silver parquet is partitioned by year / driver_abb and contains one
+    row per radio event. We dynamically infer which columns to aggregate — whatever
+    the teammate's feature engineering produces lands here, no hardcoding needed.
+
+    Metadata columns that are excluded from aggregation:
+        date, driver_number, driver_abb, year, month
+        (plus any partition columns pandas re-materialises on read)
+
+    All remaining numeric/boolean columns are aggregated as their mean
+    (proportion of events that had that flag set) grouped by
+    (driver_abb, year, month).
+
+    Matching logic (mirrors the social media join):
+        driver = gold_df["target_driver"]  (3-letter abbreviation)
+        year   = gold_df["race_year"]
+        month  = calendar month of gold_df["race_date"]
+
+    All joined columns are prefixed with "radio_" to avoid collisions.
+    Missing matches are left as NaN. A "radio_data_available" (0/1) column
+    is always added so the model can distinguish missing from zero.
+    """
+    radio_dir = _get_radio_file()
+
+    if not radio_dir.exists():
+        logging.warning(f"Radio silver directory not found at {radio_dir}. Skipping radio join.")
+        gold_df["radio_data_available"] = 0
+        return gold_df
+
+    try:
+        radio_df = pd.read_parquet(radio_dir)
+    except Exception as e:
+        logging.warning(f"Could not read radio parquet at {radio_dir}: {e}. Skipping radio join.")
+        gold_df["radio_data_available"] = 0
+        return gold_df
+
+    if radio_df.empty:
+        logging.warning("Radio silver parquet is empty. Skipping radio join.")
+        gold_df["radio_data_available"] = 0
+        return gold_df
+
+    # --- Parse date and derive grouping keys ---
+    radio_df["date"] = pd.to_datetime(radio_df["date"], utc=True, errors="coerce")
+    radio_df["_year"]  = radio_df["date"].dt.year.astype("Int64").astype(str)
+    radio_df["_month"] = radio_df["date"].dt.month.astype("Int64").astype(str)
+
+    # --- Dynamically infer which columns to aggregate ---
+    # Exclude all metadata / key / partition columns — aggregate everything else
+    metadata_cols = {
+        "date", "driver_number", "driver_abb",
+        "_year", "_month",
+        "year", "month",   # partition columns pandas re-adds on read
+    }
+    group_cols = ["driver_abb", "_year", "_month"]
+
+    agg_cols = [
+        c for c in radio_df.columns
+        if c not in metadata_cols
+        and pd.api.types.is_numeric_dtype(radio_df[c])
+    ]
+
+    if not agg_cols:
+        logging.warning(
+            "Radio parquet loaded but no numeric feature columns found. "
+            "Skipping radio join — teammate's feature engineering may not be complete yet."
+        )
+        gold_df["radio_data_available"] = 0
+        return gold_df
+
+    logging.info(f"Radio join: aggregating {len(agg_cols)} feature columns dynamically.")
+
+    # --- Aggregate: mean per (driver, year, month) + raw event count ---
+    radio_agg = (
+        radio_df[group_cols + agg_cols]
+        .groupby(group_cols, as_index=False)[agg_cols]
+        .mean()
+        .round(4)
+    )
+
+    radio_event_counts = (
+        radio_df.groupby(group_cols, as_index=False)
+        .size()
+        .rename(columns={"size": "radio_event_count"})
+    )
+    radio_agg = radio_agg.merge(radio_event_counts, on=group_cols, how="left")
+
+    # Prefix all feature columns with "radio_"
+    rename_map = {c: f"radio_{c}" for c in agg_cols}
+    radio_agg = radio_agg.rename(columns=rename_map)
+    radio_feature_cols = [f"radio_{c}" for c in agg_cols] + ["radio_event_count"]
+
+    # --- Build fast lookup: (driver_abb, year_str, month_str) -> row ---
+    radio_lookup = {
+        (row["driver_abb"], row["_year"], row["_month"]): row
+        for _, row in radio_agg.iterrows()
+    }
+
+    # --- Derive year / month from gold_df race_date ---
+    if "race_date" in gold_df.columns:
+        race_dates   = pd.to_datetime(gold_df["race_date"], errors="coerce")
+        year_series  = race_dates.dt.year.astype("Int64").astype(str)
+        month_series = race_dates.dt.month.astype("Int64").astype(str)
+    else:
+        year_series  = gold_df["race_year"].astype(str)
+        month_series = pd.Series([""] * len(gold_df), index=gold_df.index)
+
+    driver_series = gold_df["target_driver"].astype(str).str.upper()
+
+    # --- Join radio features onto gold_df ---
+    for col in radio_feature_cols:
+        gold_df[col] = float("nan")
+    gold_df["radio_data_available"] = 0
+
+    for i, (driver, year, month) in enumerate(zip(driver_series, year_series, month_series)):
+        matched_row = radio_lookup.get((driver, year, month))
+        if matched_row is not None:
+            for col in radio_feature_cols:
+                if col in matched_row:
+                    gold_df.at[gold_df.index[i], col] = matched_row[col]
+            gold_df.at[gold_df.index[i], "radio_data_available"] = 1
+
+    matched = int(gold_df["radio_data_available"].sum())
+    logging.info(
+        f"Radio join complete: {matched}/{len(gold_df)} rows matched "
+        f"({matched / len(gold_df) * 100:.1f}%)"
+    )
+
+    return gold_df
 
 def run_gold_pipeline(target_driver: str = TARGET_DRIVER) -> List[str]:
     gold_frames = []
@@ -440,16 +649,22 @@ def run_gold_pipeline(target_driver: str = TARGET_DRIVER) -> List[str]:
         logging.warning(f"No gold files created for target_driver={target_driver}")
         return []
 
-    final_gold_df = pd.concat(gold_frames, ignore_index=True, sort=False)
+    final_df = pd.concat(gold_frames, ignore_index=True, sort=False)
+
+    # Merger social media data
+    final_df = _add_social_info(final_df)
+    
+    # Merge radio analysis data
+    final_df = _add_radio_info(final_df)
 
     out_dir = GOLD_PATH / SESSION_TYPE
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_file = out_dir / f"{target_driver}_gold.parquet"
-    final_gold_df.to_parquet(out_file, index=False)
+    final_df.to_parquet(out_file, index=False)
 
     logging.info(f"Saved final gold file: {out_file}")
-    logging.info(f"Final combined gold shape: {final_gold_df.shape}")
+    logging.info(f"Final combined gold shape: {final_df.shape}")
 
     return [str(out_file)]
 

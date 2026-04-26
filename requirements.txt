@@ -12,3 +12,5 @@ fsspec
 adlfs
 textblob
 scikit-learn 
+torch
+openai-whisper
