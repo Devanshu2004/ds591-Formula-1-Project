@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 
 import fsspec
 import pandas as pd
@@ -275,9 +274,6 @@ def classify_radio(transcript, record):
         "summary": summary,
         "primary_event_type": primary,
         "secondary_event_types": secondary,
-        "speaker_direction": "unknown",
-        "urgency_level": urgency,
-        "sentiment_tone": sentiment,
         "action_required": action_required,
         "action_type": action_type,
         "strategy_signal": {
@@ -306,98 +302,193 @@ def classify_radio(transcript, record):
     }
 
 
-# --- 7. Silver Layer ---
-def run_radio_silver(session_key=None, whisper_model_size="base"):
+# Fixed set of columns so every partition file always has the same schema
+_ALL_EVENT_TYPES = [
+    "pit_call", "tire_strategy", "pace_management", "safety", "weather",
+    "damage_issue", "mechanical_issue", "overtaking", "defending",
+    "traffic", "celebration", "information_only",
+]
+_ALL_ACTION_TYPES = [
+    "pit_now", "pit_soon", "stay_out", "push", "conserve",
+    "manage_tires", "defend", "overtake", "report_issue",
+    "acknowledge_info", "unknown",
+]
+_ALL_SECONDARY_TYPES = [
+    "pit_call", "tire_strategy", "pace_management", "safety", "weather",
+    "damage_issue", "mechanical_issue", "overtaking", "defending",
+    "traffic", "celebration",
+]
+
+
+# --- 7. Feature Engineering ---
+def engineer_features(df):
     """
-    Read radio_bronze.json from ADLS, transcribe with Whisper, classify,
-    and write partitioned parquet to ADLS silver/radio_silver.parquet
-    (partitioned by year / month / driver_abb).
+    Aggregate classified radio records per driver per session into model-ready features.
+    Input:  flat DataFrame of classified radio events (one row per transmission)
+    Output: DataFrame with one row per session_key + driver_number
+    """
+    SEVERITY_MAP = {"none": 0, "minor": 1, "moderate": 2}
+
+    df = df.copy()
+    df["severity_encoded"] = df["car_issue_signal.severity"].map(SEVERITY_MAP)
+
+    grp = ["session_key", "driver_number", "driver_abb", "year"]
+
+    agg = df.groupby(grp).agg(
+        total_transmissions         =("primary_event_type",                       "count"),
+        action_required_count       =("action_required",                          "sum"),
+        issue_count                 =("car_issue_signal.has_issue",               "sum"),
+        issue_severity_mean         =("severity_encoded",                         "mean"),
+        strategy_pit_total          =("strategy_signal.pit_related",              "sum"),
+        strategy_tire_total         =("strategy_signal.tire_related",             "sum"),
+        strategy_fuel_saving_total  =("strategy_signal.fuel_saving",              "sum"),
+        strategy_pace_change_total  =("strategy_signal.pace_change",              "sum"),
+        strategy_weather_total      =("strategy_signal.weather_related",          "sum"),
+        strategy_safety_total       =("strategy_signal.safety_related",           "sum"),
+        racecraft_traffic_total     =("racecraft_signal.traffic_mentioned",       "sum"),
+        racecraft_overtake_total    =("racecraft_signal.overtake_mentioned",      "sum"),
+        racecraft_defend_total      =("racecraft_signal.defend_mentioned",        "sum"),
+        racecraft_drs_total         =("racecraft_signal.drs_mentioned",           "sum"),
+        racecraft_gap_total         =("racecraft_signal.gap_management_mentioned","sum"),
+    ).reset_index()
+
+    agg["action_required_ratio"] = agg["action_required_count"] / agg["total_transmissions"]
+
+    # One-hot counts: primary_event_type
+    event_counts = (
+        df.groupby(["session_key", "driver_number", "primary_event_type"])
+        .size().unstack(fill_value=0)
+    )
+    event_counts.columns = [f"event_{c}_count" for c in event_counts.columns]
+    agg = agg.merge(event_counts.reset_index(), on=["session_key", "driver_number"], how="left")
+
+    # One-hot counts: action_type
+    action_counts = (
+        df.groupby(["session_key", "driver_number", "action_type"])
+        .size().unstack(fill_value=0)
+    )
+    action_counts.columns = [f"action_{c}_count" for c in action_counts.columns]
+    agg = agg.merge(action_counts.reset_index(), on=["session_key", "driver_number"], how="left")
+
+    # Multi-hot counts: secondary_event_types (list column — explode first)
+    secondary_df = df[["session_key", "driver_number", "secondary_event_types"]].explode("secondary_event_types")
+    secondary_df = secondary_df.dropna(subset=["secondary_event_types"])
+    secondary_df = secondary_df[secondary_df["secondary_event_types"] != ""]
+    if not secondary_df.empty:
+        secondary_counts = (
+            secondary_df.groupby(["session_key", "driver_number", "secondary_event_types"])
+            .size().unstack(fill_value=0)
+        )
+        secondary_counts.columns = [f"secondary_{c}_count" for c in secondary_counts.columns]
+        agg = agg.merge(secondary_counts.reset_index(), on=["session_key", "driver_number"], how="left")
+
+    # Ensure every expected column exists (so all partition files share the same schema)
+    for et in _ALL_EVENT_TYPES:
+        col = f"event_{et}_count"
+        if col not in agg.columns:
+            agg[col] = 0
+    for at in _ALL_ACTION_TYPES:
+        col = f"action_{at}_count"
+        if col not in agg.columns:
+            agg[col] = 0
+    for st in _ALL_SECONDARY_TYPES:
+        col = f"secondary_{st}_count"
+        if col not in agg.columns:
+            agg[col] = 0
+
+    agg = agg.fillna(0)
+
+    # Cast all *_count columns to int
+    count_cols = [c for c in agg.columns if c.endswith("_count")]
+    agg[count_cols] = agg[count_cols].astype(int)
+
+    return agg
+
+
+# --- 8. Silver Layer ---
+def run_radio_silver(session_key=None):
+    """
+    Read radio_transcripts.json from ADLS bronze (pre-transcribed by Whisper on SCC/Colab),
+    classify each transcript, engineer features, and write two parquets to ADLS silver:
+      - silver/radio_data/      raw classified records (year / driver_abb)
+      - silver/radio_features/  aggregated model-ready features (year / driver_abb)
 
     Returns nested JSON:
-        { "Status": "Success", "Year": { year: { "Month": { month: { driver_abb: { event_type: count } } } } } }
+        { "Status": "Success", "Year": { year: { driver_abb: { event_type: count } } } }
     """
     storage_options = get_storage_options()
     bronze_container = os.getenv("BRONZE_CONTAINER", "bronze")
     silver_container = os.getenv("SILVER_CONTAINER", "silver")
 
-    input_path = _abfs_path(bronze_container, "radio_bronze.json")
-    log.info("Reading bronze data from %s", input_path)
+    input_path = _abfs_path(bronze_container, "radio_transcripts.json")
+    log.info("Reading transcripts from %s", input_path)
 
     with fsspec.open(input_path, "r", **storage_options) as f:
         raw_data = json.load(f)
 
     if session_key:
         raw_data = [r for r in raw_data if r.get("session_key") == session_key]
-        log.info("Filtered to %d recordings for session %s", len(raw_data), session_key)
+        log.info("Filtered to %d records for session %s", len(raw_data), session_key)
 
     if not raw_data:
         log.warning("No records found in bronze.")
         return {"Status": "No data", "Year": {}}
 
-    import torch
-    import whisper
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("Loading Whisper '%s' on %s...", whisper_model_size, device)
-    model = whisper.load_model(whisper_model_size, device=device)
-
     events = []
     failed = 0
 
     for i, record in enumerate(raw_data):
-        url = record.get("recording_url")
-        if not url:
-            failed += 1
-            continue
-
-        try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-        except Exception as e:
-            log.debug("Download failed for %s: %s", url, e)
-            failed += 1
-            continue
-
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(r.content)
-            tmppath = tmp.name
-
-        try:
-            transcript = model.transcribe(tmppath)["text"].strip()
-        except Exception as e:
-            log.debug("Transcription failed: %s", e)
-            failed += 1
-            continue
-        finally:
-            if os.path.exists(tmppath):
-                os.unlink(tmppath)
-
+        transcript = record.get("transcript", "").strip()
         if not transcript:
             failed += 1
             continue
 
         events.append(classify_radio(transcript, record))
 
-        if (i + 1) % 100 == 0:
-            log.info("  Processed %d/%d (failed: %d)", i + 1, len(raw_data), failed)
+        if (i + 1) % 500 == 0:
+            log.info("  Classified %d/%d", i + 1, len(raw_data))
 
-    log.info("Classified %d events (%d failed/skipped)", len(events), failed)
+    log.info("Classified %d events (%d skipped — empty transcript)", len(events), failed)
 
     if not events:
         return {"Status": "No events produced", "Year": {}}
 
     df = pd.json_normalize(events)
     df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    df["year"] = df["date"].dt.year.astype(str)
-    df["month"] = df["date"].dt.month.astype(str)
+    df = df.dropna(subset=["date"])
+    df["year"] = df["date"].dt.year.astype(int).astype(str)
+    df = df[df["year"].isin(["2024", "2025"])].reset_index(drop=True)
+    log.info("After year filter (2024/2025): %d records", len(df))
 
-    output_path = _abfs_path(silver_container, "radio_data")
-    df.to_parquet(
-        output_path,
-        index=False,
-        storage_options=storage_options,
-        partition_cols=["year", "driver_abb"],
+    import pyarrow as pa
+    import pyarrow.dataset as pad
+    import adlfs
+
+    fs = adlfs.AzureBlobFileSystem(**get_storage_options())
+
+    output_path = f"{silver_container}/radio_data"
+    pad.write_dataset(
+        pa.Table.from_pandas(df, preserve_index=False),
+        base_dir=output_path,
+        format="parquet",
+        partitioning=pad.partitioning(pa.schema([("year", pa.string()), ("driver_abb", pa.string())])),
+        filesystem=fs,
+        existing_data_behavior="delete_matching",
     )
-    log.info("Written parquet to %s", output_path)
+    log.info("Written raw classified records to silver/%s", output_path)
+
+    # Feature engineering → silver/radio_features/
+    features_df = engineer_features(df)
+    features_path = f"{silver_container}/radio_features"
+    pad.write_dataset(
+        pa.Table.from_pandas(features_df, preserve_index=False),
+        base_dir=features_path,
+        format="parquet",
+        partitioning=pad.partitioning(pa.schema([("year", pa.string()), ("driver_abb", pa.string())])),
+        filesystem=fs,
+        existing_data_behavior="delete_matching",
+    )
+    log.info("Written engineered features to silver/%s", features_path)
 
     grouped = (
         df.groupby(["year", "driver_abb", "primary_event_type"])
