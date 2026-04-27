@@ -405,17 +405,47 @@ def engineer_features(df):
     return agg
 
 
+def _gp_name_from_url(url):
+    """Extract GP name from recording URL, e.g. '2024-03-02_Bahrain_Grand_Prix' → 'Bahrain Grand Prix'."""
+    m = re.search(r"/\d{4}/\d{4}-\d{2}-\d{2}_([^/]+)/", str(url))
+    return m.group(1).replace("_", " ") if m else "Unknown GP"
+
+
+def _fetch_session_starts():
+    """Fetch {session_key: session_start (UTC datetime)} for all Race sessions from OpenF1."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/sessions",
+            params={"session_type": "Race"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        lookup = {}
+        for s in resp.json():
+            if s.get("date_start"):
+                lookup[s["session_key"]] = pd.to_datetime(s["date_start"], utc=True)
+        log.info("Fetched session start times for %d race sessions", len(lookup))
+        return lookup
+    except Exception as e:
+        log.warning("Could not fetch session start times from OpenF1: %s", e)
+        return {}
+
+
 # --- 8. Silver Layer ---
 def run_radio_silver(session_key=None):
     """
     Read radio_transcripts.json from ADLS bronze (pre-transcribed by Whisper on SCC/Colab),
-    classify each transcript, engineer features, and write two parquets to ADLS silver:
-      - silver/radio_data/      raw classified records (year / driver_abb)
-      - silver/radio_features/  aggregated model-ready features (year / driver_abb)
+    classify each transcript, and write to ADLS silver:
+      - silver/radio.parquet   flat file, one row per transcript
+                               includes GP name + radio_session_time (seconds since race start)
 
     Returns nested JSON:
         { "Status": "Success", "Year": { year: { driver_abb: { event_type: count } } } }
     """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import adlfs
+
     storage_options = get_storage_options()
     bronze_container = os.getenv("BRONZE_CONTAINER", "bronze")
     silver_container = os.getenv("SILVER_CONTAINER", "silver")
@@ -436,15 +466,12 @@ def run_radio_silver(session_key=None):
 
     events = []
     failed = 0
-
     for i, record in enumerate(raw_data):
         transcript = record.get("transcript", "").strip()
         if not transcript:
             failed += 1
             continue
-
         events.append(classify_radio(transcript, record))
-
         if (i + 1) % 500 == 0:
             log.info("  Classified %d/%d", i + 1, len(raw_data))
 
@@ -460,42 +487,43 @@ def run_radio_silver(session_key=None):
     df = df[df["year"].isin(["2024", "2025"])].reset_index(drop=True)
     log.info("After year filter (2024/2025): %d records", len(df))
 
-    import pyarrow as pa
-    import pyarrow.dataset as pad
-    import adlfs
+    # Derive GP name from recording URL
+    df["grand_prix_name"] = df["recording_url"].apply(_gp_name_from_url)
+
+    # Add radio_session_time: seconds elapsed since race start
+    session_starts = _fetch_session_starts()
+    df["session_start"] = df["session_key"].map(session_starts)
+    df["radio_session_time"] = (
+        df["date"] - df["session_start"]
+    ).dt.total_seconds().round(1)
+    df = df.drop(columns=["session_start"])
+
+    # Rename date → recording_time and drop noisy text columns
+    df = df.rename(columns={"date": "recording_time"})
+    df = df.drop(columns=["summary", "evidence_phrases", "notes"], errors="ignore")
+
+    # Reorder columns: identifiers → time → GP → transcript → signals
+    id_cols     = ["session_key", "meeting_key", "year", "driver_number", "driver_abb"]
+    time_cols   = ["recording_time", "radio_session_time"]
+    race_cols   = ["grand_prix_name"]
+    text_cols   = ["recording_url", "transcript_cleaned", "transcript_quality"]
+    signal_cols = [c for c in df.columns if c not in id_cols + time_cols + race_cols + text_cols]
+    df = df[id_cols + time_cols + race_cols + text_cols + signal_cols]
 
     fs = adlfs.AzureBlobFileSystem(**get_storage_options())
 
-    output_path = f"{silver_container}/radio_data"
-    pad.write_dataset(
-        pa.Table.from_pandas(df, preserve_index=False),
-        base_dir=output_path,
-        format="parquet",
-        partitioning=pad.partitioning(pa.schema([("year", pa.string()), ("driver_abb", pa.string())])),
-        filesystem=fs,
-        existing_data_behavior="delete_matching",
-    )
-    log.info("Written raw classified records to silver/%s", output_path)
-
-    # Feature engineering → silver/radio_features/
-    features_df = engineer_features(df)
-    features_path = f"{silver_container}/radio_features"
-    pad.write_dataset(
-        pa.Table.from_pandas(features_df, preserve_index=False),
-        base_dir=features_path,
-        format="parquet",
-        partitioning=pad.partitioning(pa.schema([("year", pa.string()), ("driver_abb", pa.string())])),
-        filesystem=fs,
-        existing_data_behavior="delete_matching",
-    )
-    log.info("Written engineered features to silver/%s", features_path)
+    # ── silver/radio.parquet — flat, one row per transcript ───────────────────
+    radio_path = f"{silver_container}/radio.parquet"
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    with fs.open(radio_path, "wb") as f_out:
+        pq.write_table(table, f_out)
+    log.info("Written flat radio records to silver/radio.parquet (%d rows)", len(df))
 
     grouped = (
         df.groupby(["year", "driver_abb", "primary_event_type"])
         .size()
         .reset_index(name="count")
     )
-
     nested = {}
     for _, row in grouped.iterrows():
         year, driver, event_type, count = (
