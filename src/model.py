@@ -127,30 +127,29 @@ def abfs_path(container: str, path: str) -> str:
 
 
 def blob_path(container: str, path: str) -> str:
-    """
-    Returns the bare container/path string used by fsspec
-    (without the abfs:// scheme prefix).
-    """
     return f"{container}/{path}"
 
 
 # ── Column Definitions ─────────────────────────────────────────
 
-TARGET_COL       = "target_pos"
-SOCIAL_SCORE_COL = "target_driver_social_score"
-SESSION_TIME_COL = "session_time"
-RACE_GROUP_COLS  = ["race_id", "race_year", "race_location"]
+TARGET_COL        = "target_pos"
+SOCIAL_SCORE_COL  = "social_life_score"       # updated name
+SESSION_TIME_COL  = "session_time"
+RADIO_FLAG_COL    = "radio_data_available"    # 0 = no radio, 1 = radio active
+RACE_GROUP_COLS   = ["race_id", "race_year", "race_location"]
 
+# Columns to drop — string name cols and metadata
 DROP_COLS = {
-    "target_driver",
-    "driver_ahead",
-    "driver_behind",
-    "target_rpm",
-    "driver_ahead_rpm",
-    "driver_behind_rpm",
-    "race_date",
+    "target_driver",        # string name — use target_driver_number instead
+    "driver_ahead",         # string name — use driver_ahead_number instead
+    "driver_behind",        # string name — use driver_behind_number instead
+    "target_rpm",           # dropped per instruction
+    "driver_ahead_rpm",     # dropped per instruction
+    "driver_behind_rpm",    # dropped per instruction
+    "race_date",            # metadata
 }
 
+# Meta cols — used for grouping/sorting/target/social but NOT fed to LSTM
 META_COLS = {
     SESSION_TIME_COL,
     "race_id",
@@ -159,77 +158,89 @@ META_COLS = {
     "race_location",
     TARGET_COL,
     SOCIAL_SCORE_COL,
+    RADIO_FLAG_COL,         # used as attention gate, not as LSTM feature
 }
 
+# Radio feature columns — all prefixed with radio_ (excluding the flag)
+# These are NaN when radio_data_available = 0
+# We use radio_data_available as the sparse attention gate
 RADIO_COLS = [
-    "primary_event_type_pit_call",
-    "primary_event_type_damage_issue",
-    "primary_event_type_mechanical_issue",
-    "primary_event_type_safety",
-    "primary_event_type_weather",
-    "primary_event_type_tire_strategy",
-    "primary_event_type_pace_management",
-    "primary_event_type_overtaking",
-    "primary_event_type_defending",
-    "primary_event_type_traffic",
-    "primary_event_type_celebration",
-    "primary_event_type_information_only",
-    "secondary_event_type_pit_call",
-    "secondary_event_type_damage_issue",
-    "secondary_event_type_mechanical_issue",
-    "secondary_event_type_safety",
-    "secondary_event_type_weather",
-    "secondary_event_type_tire_strategy",
-    "secondary_event_type_pace_management",
-    "secondary_event_type_overtaking",
-    "secondary_event_type_defending",
-    "secondary_event_type_traffic",
-    "secondary_event_type_celebration",
-    "secondary_event_type_information_only",
-    "urgency_low",
-    "urgency_medium",
-    "urgency_high",
-    "sentiment_positive",
-    "sentiment_negative",
-    "sentiment_urgent",
-    "sentiment_neutral",
-    "action_pit_now",
-    "action_pit_soon",
-    "action_stay_out",
-    "action_push",
-    "action_conserve",
-    "action_manage_tires",
-    "action_defend",
-    "action_overtake",
-    "action_report_issue",
-    "action_acknowledge_info",
-    "action_unknown",
-    "issue_none",
-    "issue_wing_damage",
-    "issue_floor_damage",
-    "issue_engine",
-    "issue_brakes",
-    "issue_gearbox",
-    "issue_battery",
-    "issue_overheating",
-    "issue_steering",
-    "issue_unknown",
-    "severity_none",
-    "severity_minor",
-    "severity_moderate",
-    "action_required",
-    "strategy_pit_related",
-    "strategy_tire_related",
-    "strategy_fuel_saving",
-    "strategy_pace_change",
-    "strategy_weather_related",
-    "strategy_safety_related",
-    "car_has_issue",
-    "racecraft_traffic_mentioned",
-    "racecraft_overtake_mentioned",
-    "racecraft_defend_mentioned",
-    "racecraft_drs_mentioned",
-    "racecraft_gap_management_mentioned",
+    # Quality / confidence
+    "radio_transcript_quality",
+    "radio_confidence",
+    "radio_action_required",
+
+    # Primary event type
+    "radio_primary_event_type_celebration",
+    "radio_primary_event_type_damage_issue",
+    "radio_primary_event_type_defending",
+    "radio_primary_event_type_information_only",
+    "radio_primary_event_type_mechanical_issue",
+    "radio_primary_event_type_overtaking",
+    "radio_primary_event_type_pace_management",
+    "radio_primary_event_type_pit_call",
+    "radio_primary_event_type_safety",
+    "radio_primary_event_type_tire_strategy",
+    "radio_primary_event_type_traffic",
+    "radio_primary_event_type_weather",
+
+    # Action type
+    "radio_action_type_acknowledge_info",
+    "radio_action_type_conserve",
+    "radio_action_type_defend",
+    "radio_action_type_manage_tires",
+    "radio_action_type_overtake",
+    "radio_action_type_pit_now",
+    "radio_action_type_pit_soon",
+    "radio_action_type_push",
+    "radio_action_type_report_issue",
+    "radio_action_type_stay_out",
+    "radio_action_type_unknown",
+
+    # Secondary event type
+    "radio_secondary_event_type_celebration",
+    "radio_secondary_event_type_damage_issue",
+    "radio_secondary_event_type_defending",
+    "radio_secondary_event_type_information_only",
+    "radio_secondary_event_type_mechanical_issue",
+    "radio_secondary_event_type_overtaking",
+    "radio_secondary_event_type_pace_management",
+    "radio_secondary_event_type_pit_call",
+    "radio_secondary_event_type_safety",
+    "radio_secondary_event_type_tire_strategy",
+    "radio_secondary_event_type_traffic",
+    "radio_secondary_event_type_weather",
+
+    # Car issue signals
+    "radio_car_issue_signal.has_issue",
+    "radio_car_issue_signal.issue_type_battery",
+    "radio_car_issue_signal.issue_type_brakes",
+    "radio_car_issue_signal.issue_type_engine",
+    "radio_car_issue_signal.issue_type_floor_damage",
+    "radio_car_issue_signal.issue_type_gearbox",
+    "radio_car_issue_signal.issue_type_none",
+    "radio_car_issue_signal.issue_type_overheating",
+    "radio_car_issue_signal.issue_type_steering",
+    "radio_car_issue_signal.issue_type_unknown",
+    "radio_car_issue_signal.issue_type_wing_damage",
+    "radio_car_issue_signal.severity_minor",
+    "radio_car_issue_signal.severity_moderate",
+    "radio_car_issue_signal.severity_none",
+
+    # Strategy signals
+    "radio_strategy_signal.pit_related",
+    "radio_strategy_signal.tire_related",
+    "radio_strategy_signal.fuel_saving",
+    "radio_strategy_signal.pace_change",
+    "radio_strategy_signal.weather_related",
+    "radio_strategy_signal.safety_related",
+
+    # Racecraft signals
+    "radio_racecraft_signal.traffic_mentioned",
+    "radio_racecraft_signal.overtake_mentioned",
+    "radio_racecraft_signal.defend_mentioned",
+    "radio_racecraft_signal.drs_mentioned",
+    "radio_racecraft_signal.gap_management_mentioned",
 ]
 
 
@@ -254,30 +265,24 @@ def load_driver_parquet(driver: str) -> Optional[pd.DataFrame]:
 
 
 def save_model_to_azure(local_path: str, blob_name: str):
-    """
-    Upload local model file to platinum container.
-    Structure: platinum/models/{filename}
-    """
+    """Upload local model file to platinum/models/"""
     try:
-        fs         = get_fs()
-        remote     = blob_path(MODEL_CONTAINER, blob_name)
+        fs     = get_fs()
+        remote = blob_path(MODEL_CONTAINER, blob_name)
         fs.put(local_path, remote)
-        logging.info(f"Uploaded to Azure: {MODEL_CONTAINER}/{blob_name}")
+        logging.info(f"Uploaded: {MODEL_CONTAINER}/{blob_name}")
     except Exception as e:
         logging.warning(f"Could not upload {blob_name}: {e}")
 
 
 def load_model_from_azure(blob_name: str, local_path: str):
-    """
-    Download model file from platinum container to local disk.
-    Structure: platinum/models/{filename}
-    """
+    """Download model file from platinum/models/ to local disk."""
     try:
         fs     = get_fs()
         remote = blob_path(MODEL_CONTAINER, blob_name)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         fs.get(remote, local_path)
-        logging.info(f"Downloaded from Azure: {MODEL_CONTAINER}/{blob_name}")
+        logging.info(f"Downloaded: {MODEL_CONTAINER}/{blob_name}")
     except Exception as e:
         logging.warning(f"Could not download {blob_name}: {e}")
 
@@ -289,13 +294,16 @@ class DriverDataset(Dataset):
     Builds sequences from a driver's gold DataFrame.
     All features assumed numerical and ready — no preprocessing.
 
-    DataFrame must contain:
-        - TARGET_COL        : target_pos (1-20)
-        - SOCIAL_SCORE_COL  : static float per race
-        - SESSION_TIME_COL  : float seconds, for sorting
-        - RACE_GROUP_COLS   : race_id, race_year, race_location
-        - RADIO_COLS        : 0.0 when no event at that timestep
-        - All other cols    : main Bi-LSTM features
+    Key design decisions:
+    - radio_data_available is used as the sparse attention gate signal,
+      NOT as a feature fed into the Bi-LSTM
+    - All radio feature cols are NaN when radio_data_available = 0,
+      filled with 0.0 before feeding to the attention module
+    - social_life_score is NaN where no social data exists,
+      filled with 5.0 (neutral midpoint of 1-10 scale)
+    - DROP_COLS and string name cols are excluded before building sequences
+    - Dynamic OHE columns (team, compound, gear, track_status) are
+      auto-detected from CSV headers — no hardcoding needed
 
     Sliding window:
         - Group by (race_id, race_year, race_location)
@@ -307,34 +315,54 @@ class DriverDataset(Dataset):
     """
 
     def __init__(self, df: pd.DataFrame):
-        drop      = DROP_COLS | META_COLS
-        df_clean  = df.drop(columns=[c for c in drop if c in df.columns])
+        # Drop unwanted columns
+        drop     = DROP_COLS | META_COLS
+        df_clean = df.drop(columns=[c for c in drop if c in df.columns])
 
-        present_radio     = [c for c in RADIO_COLS if c in df_clean.columns]
-        radio_set         = set(present_radio)
+        # Identify radio columns present in this DataFrame
+        present_radio = [c for c in RADIO_COLS if c in df_clean.columns]
+        radio_set     = set(present_radio)
+
+        # Feature columns: everything except radio cols
+        # Dynamic OHE cols (team/compound/gear/track_status) are
+        # automatically included here
         self.feature_cols = sorted([
             c for c in df_clean.columns if c not in radio_set
         ])
-        self.radio_cols   = present_radio
+        self.radio_cols = present_radio
 
         self.sequences       = []
         self.targets         = []
         self.social_scores   = []
         self.radio_sequences = []
+        self.radio_gates     = []   # 1.0 where radio active, 0.0 where silent
 
         group_keys = [c for c in RACE_GROUP_COLS if c in df.columns]
 
         for _, race_df in df.groupby(group_keys):
-            race_df   = race_df.sort_values(SESSION_TIME_COL).reset_index(drop=True)
+            race_df = race_df.sort_values(SESSION_TIME_COL).reset_index(drop=True)
+
             features  = race_df[self.feature_cols].fillna(0).values.astype(np.float32)
             positions = race_df[TARGET_COL].values.astype(np.float32)
-            social    = float(race_df[SOCIAL_SCORE_COL].iloc[0])
 
-            radio = (
-                race_df[present_radio].fillna(0).values.astype(np.float32)
-                if present_radio
-                else np.zeros((len(race_df), 1), dtype=np.float32)
+            # Social score: NaN → 5.0 (neutral midpoint)
+            social = float(
+                race_df[SOCIAL_SCORE_COL].fillna(5.0).iloc[0]
+                if SOCIAL_SCORE_COL in race_df.columns
+                else 5.0
             )
+
+            # Radio gate: 1.0 where radio_data_available = 1, else 0.0
+            if RADIO_FLAG_COL in race_df.columns:
+                gate = race_df[RADIO_FLAG_COL].fillna(0).values.astype(np.float32)
+            else:
+                gate = np.zeros(len(race_df), dtype=np.float32)
+
+            # Radio features: NaN → 0.0 (no event)
+            if present_radio:
+                radio = race_df[present_radio].fillna(0).values.astype(np.float32)
+            else:
+                radio = np.zeros((len(race_df), 1), dtype=np.float32)
 
             n            = len(features)
             min_required = SEQUENCE_LENGTH + PREDICTION_HORIZON
@@ -354,9 +382,10 @@ class DriverDataset(Dataset):
                     continue
 
                 self.sequences.append(features[i: i + SEQUENCE_LENGTH])
-                self.targets.append(int(target) - 1)
+                self.targets.append(int(target) - 1)   # 0-indexed
                 self.social_scores.append(social)
                 self.radio_sequences.append(radio[i: i + SEQUENCE_LENGTH])
+                self.radio_gates.append(gate[i: i + SEQUENCE_LENGTH])
 
         logging.info(
             f"Dataset: {len(self.sequences)} sequences | "
@@ -373,6 +402,7 @@ class DriverDataset(Dataset):
             torch.tensor(self.targets[idx],       dtype=torch.long),
             torch.tensor(self.social_scores[idx], dtype=torch.float32),
             torch.tensor(self.radio_sequences[idx]),
+            torch.tensor(self.radio_gates[idx]),  # (seq_len,) gate signal
         )
 
 
@@ -381,25 +411,37 @@ class DriverDataset(Dataset):
 class RadioAttention(nn.Module):
     """
     Sparse attention gate for radio events.
-    Silent timesteps pass through unchanged.
-    Active timesteps are modulated by radio content.
+
+    Uses radio_data_available as the gate signal — cleaner and more
+    reliable than checking if radio feature values are zero.
+
+    gate = 0.0 → silent timestep → hidden state unchanged
+    gate = 1.0 → radio event    → hidden state modulated by radio content
     """
 
     def __init__(self, hidden_size: int, radio_dim: int):
         super().__init__()
         self.radio_proj = nn.Linear(radio_dim, hidden_size * 2)
-        self.gate       = nn.Linear(hidden_size * 2, 1)
+        self.gate_proj  = nn.Linear(hidden_size * 2, 1)
         self.sigmoid    = nn.Sigmoid()
 
     def forward(
         self,
-        lstm_out: torch.Tensor,  # (batch, seq_len, hidden*2)
-        radio:    torch.Tensor,  # (batch, seq_len, radio_dim)
+        lstm_out:   torch.Tensor,  # (batch, seq_len, hidden*2)
+        radio:      torch.Tensor,  # (batch, seq_len, radio_dim)
+        radio_gate: torch.Tensor,  # (batch, seq_len) — from radio_data_available
     ) -> torch.Tensor:
-        has_event = (radio.abs().sum(dim=-1, keepdim=True) > 0).float()
-        proj      = torch.tanh(self.radio_proj(radio))
-        gate      = self.sigmoid(self.gate(lstm_out + proj))
-        return lstm_out + (gate * proj * has_event)
+        # Expand gate to (batch, seq_len, 1)
+        gate_mask = radio_gate.unsqueeze(-1)
+
+        # Project radio features to hidden space
+        proj = torch.tanh(self.radio_proj(radio))
+
+        # Compute soft attention weight
+        attn = self.sigmoid(self.gate_proj(lstm_out + proj))
+
+        # Apply only at active radio timesteps
+        return lstm_out + (attn * proj * gate_mask)
 
 
 # ── Driver Channel (Bi-LSTM) ───────────────────────────────────
@@ -407,6 +449,9 @@ class RadioAttention(nn.Module):
 class DriverChannel(nn.Module):
     """
     Bi-LSTM channel for a single driver.
+
+    input_size : auto-detected from gold DataFrame feature columns
+    radio_dim  : auto-detected from gold DataFrame radio columns
 
     Forward returns:
         embedding : (batch, EMBEDDING_DIM)  →  Random Forest input
@@ -426,8 +471,11 @@ class DriverChannel(nn.Module):
         )
 
         self.radio_attention = RadioAttention(LSTM_HIDDEN_SIZE, radio_dim)
-        self.social_proj     = nn.Linear(1, LSTM_HIDDEN_SIZE * 2)
-        self.dropout         = nn.Dropout(DROPOUT)
+
+        # Social score injected as additive bias on final hidden state
+        self.social_proj = nn.Linear(1, LSTM_HIDDEN_SIZE * 2)
+
+        self.dropout = nn.Dropout(DROPOUT)
 
         self.embedding_proj = nn.Sequential(
             nn.Linear(LSTM_HIDDEN_SIZE * 2, EMBEDDING_DIM),
@@ -439,18 +487,26 @@ class DriverChannel(nn.Module):
 
     def forward(
         self,
-        x:      torch.Tensor,  # (batch, seq_len, input_size)
-        social: torch.Tensor,  # (batch,)
-        radio:  torch.Tensor,  # (batch, seq_len, radio_dim)
+        x:          torch.Tensor,  # (batch, seq_len, input_size)
+        social:     torch.Tensor,  # (batch,)
+        radio:      torch.Tensor,  # (batch, seq_len, radio_dim)
+        radio_gate: torch.Tensor,  # (batch, seq_len)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         lstm_out, _ = self.bilstm(x)
-        lstm_out    = self.radio_attention(lstm_out, radio)
-        last        = lstm_out[:, -1, :]
-        last        = last + torch.tanh(self.social_proj(social.unsqueeze(-1)))
-        last        = self.dropout(last)
-        emb         = self.embedding_proj(last)
-        logits      = self.classifier(emb)
+        # (batch, seq_len, hidden*2)
+
+        lstm_out = self.radio_attention(lstm_out, radio, radio_gate)
+
+        last = lstm_out[:, -1, :]
+        # (batch, hidden*2)
+
+        # Add social score as bias (NaN already filled with 5.0 in Dataset)
+        last = last + torch.tanh(self.social_proj(social.unsqueeze(-1)))
+
+        last   = self.dropout(last)
+        emb    = self.embedding_proj(last)   # (batch, EMBEDDING_DIM)
+        logits = self.classifier(emb)        # (batch, NUM_POSITIONS)
 
         return emb, logits
 
@@ -463,9 +519,9 @@ def train_driver_channel(
     device:   torch.device,
 ) -> bool:
     """
-    Load driver data from Azure gold container,
+    Load driver gold parquet from Azure,
     train Bi-LSTM channel, save weights locally and
-    upload to platinum/models/{driver}.pt on Azure.
+    upload to platinum/models/channel_{driver}.pt
     """
     logging.info(f"Training channel: {driver}")
 
@@ -482,6 +538,11 @@ def train_driver_channel(
     input_size = len(dataset.feature_cols)
     radio_dim  = len(dataset.radio_cols) if dataset.radio_cols else 1
 
+    logging.info(
+        f"  {driver}: {len(dataset)} sequences | "
+        f"input_size={input_size} | radio_dim={radio_dim}"
+    )
+
     loader    = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     model     = DriverChannel(input_size, radio_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -493,14 +554,15 @@ def train_driver_channel(
     model.train()
     for epoch in range(EPOCHS):
         total_loss = 0.0
-        for x_b, y_b, s_b, r_b in loader:
+        for x_b, y_b, s_b, r_b, g_b in loader:
             x_b = x_b.to(device)
             y_b = y_b.to(device)
             s_b = s_b.to(device)
             r_b = r_b.to(device)
+            g_b = g_b.to(device)
 
             optimizer.zero_grad()
-            _, logits = model(x_b, s_b, r_b)
+            _, logits = model(x_b, s_b, r_b, g_b)
             loss      = criterion(logits, y_b)
             loss.backward()
             optimizer.step()
@@ -578,12 +640,8 @@ def extract_embeddings(
     for driver in DRIVER_LIST:
         local_path = os.path.join(save_dir, f"channel_{driver}.pt")
 
-        # Try downloading from Azure if not available locally
         if not os.path.exists(local_path):
-            load_model_from_azure(
-                f"models/channel_{driver}.pt",
-                local_path,
-            )
+            load_model_from_azure(f"models/channel_{driver}.pt", local_path)
 
         if not os.path.exists(local_path):
             logging.warning(f"Skipping {driver} — no saved channel")
@@ -610,11 +668,12 @@ def extract_embeddings(
         embs, tgts = [], []
 
         with torch.no_grad():
-            for x_b, y_b, s_b, r_b in loader:
+            for x_b, y_b, s_b, r_b, g_b in loader:
                 emb, _ = model(
                     x_b.to(device),
                     s_b.to(device),
                     r_b.to(device),
+                    g_b.to(device),
                 )
                 embs.append(emb.cpu().numpy())
                 tgts.append(y_b.numpy())
@@ -675,12 +734,10 @@ def train_random_forest(
     )
     rf.fit(X, y)
 
-    # Save locally
     local_rf = os.path.join(save_dir, "random_forest.joblib")
     joblib.dump(rf, local_rf)
     logging.info(f"Random Forest saved locally: {local_rf}")
 
-    # Upload to platinum/models/random_forest.joblib
     save_model_to_azure(local_rf, "models/random_forest.joblib")
 
     return rf
@@ -700,10 +757,7 @@ def load_channel(
     local_path = os.path.join(save_dir, f"channel_{driver}.pt")
 
     if not os.path.exists(local_path):
-        load_model_from_azure(
-            f"models/channel_{driver}.pt",
-            local_path,
-        )
+        load_model_from_azure(f"models/channel_{driver}.pt", local_path)
 
     if not os.path.exists(local_path):
         logging.warning(f"No saved channel for {driver}")
@@ -732,9 +786,10 @@ def predict(
     live_data format:
     {
         "LEC": {
-            "features":     np.ndarray shape (SEQUENCE_LENGTH, input_size),
-            "social_score": float,
-            "radio":        np.ndarray shape (SEQUENCE_LENGTH, radio_dim),
+            "features":     np.ndarray  shape (SEQUENCE_LENGTH, input_size),
+            "social_score": float,      NaN → filled with 5.0 automatically
+            "radio":        np.ndarray  shape (SEQUENCE_LENGTH, radio_dim),
+            "radio_gate":   np.ndarray  shape (SEQUENCE_LENGTH,)  0.0 or 1.0
         },
         "VER": { ... },
         ...
@@ -742,9 +797,8 @@ def predict(
 
     - Driver keys must match DRIVER_ABB keys (e.g. "LEC", "VER")
     - SEQUENCE_LENGTH = 300 timesteps = 30 seconds at 0.1s resolution
+    - radio_gate comes from radio_data_available column
     - Missing drivers are zero-padded in the RF input
-    - Models loaded from local save_dir or downloaded from
-      platinum/models/ on Azure if not found locally
 
     Returns:
     {
@@ -779,8 +833,13 @@ def predict(
                 ).unsqueeze(0).to(device)
                 # (1, SEQUENCE_LENGTH, input_size)
 
+                # Handle NaN social score
+                social_val = d.get("social_score", 5.0)
+                if social_val is None or (isinstance(social_val, float) and np.isnan(social_val)):
+                    social_val = 5.0
+
                 s = torch.tensor(
-                    [d["social_score"]], dtype=torch.float32
+                    [social_val], dtype=torch.float32
                 ).to(device)
                 # (1,)
 
@@ -789,8 +848,13 @@ def predict(
                 ).unsqueeze(0).to(device)
                 # (1, SEQUENCE_LENGTH, radio_dim)
 
+                g = torch.tensor(
+                    d["radio_gate"], dtype=torch.float32
+                ).unsqueeze(0).to(device)
+                # (1, SEQUENCE_LENGTH)
+
                 with torch.no_grad():
-                    emb, _ = model(x, s, r)
+                    emb, _ = model(x, s, r, g)
                 row.append(emb.cpu().numpy().squeeze())
             else:
                 row.append(np.zeros(EMBEDDING_DIM, dtype=np.float32))

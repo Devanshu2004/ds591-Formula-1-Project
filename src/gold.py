@@ -44,7 +44,9 @@ def _get_social_file():
     return SILVER_PATH / f"{file_name}"
 
 def _get_radio_file():
-    ... # TBD
+    file_name = "radio.parquet"
+    print(SILVER_PATH / f"{file_name}")
+    return SILVER_PATH / f"{file_name}"
 
 def preprocess_race_df(df: pd.DataFrame, target_driver: str) -> pd.DataFrame:
     if df.empty:
@@ -483,132 +485,201 @@ def _add_social_info(gold_df: pd.DataFrame) -> pd.DataFrame:
 
 def _add_radio_info(gold_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Joins radio features from the radio silver parquet onto the gold DataFrame.
+    Aligns radio events onto the gold DataFrame at their exact session_time moment.
 
-    The radio silver parquet is partitioned by year / driver_abb and contains one
-    row per radio event. We dynamically infer which columns to aggregate — whatever
-    the teammate's feature engineering produces lands here, no hardcoding needed.
+    Each radio event is matched to the single closest session_time row for that
+    driver in that race using a nearest-neighbour asof join. All other rows remain
+    null — there is no aggregation. This preserves the temporal signal of when a
+    communication actually happened (pit call at lap 20, mechanical issue at lap 45, etc.)
 
-    Metadata columns that are excluded from aggregation:
-        date, driver_number, driver_abb, year, month
-        (plus any partition columns pandas re-materialises on read)
+    Join key:
+        radio  : driver_abb + year + grand_prix_name + radio_session_time (seconds)
+        gold   : target_driver + race_year + race_location + session_time (seconds)
 
-    All remaining numeric/boolean columns are aggregated as their mean
-    (proportion of events that had that flag set) grouped by
-    (driver_abb, year, month).
+    Column handling:
+        Dropped (metadata, not features):
+            session_key, meeting_key, driver_number, recording_time,
+            recording_url, transcript_cleaned, radio_session_time
+        transcript_quality   -> ordinal numeric  (low=0, medium=1, high=2)
+        primary_event_type, action_type,
+        car_issue_signal.issue_type,
+        car_issue_signal.severity -> one-hot encoded (prefix = column name)
+        secondary_event_types     -> multi-label one-hot (list column, exploded)
+        All bool / numeric cols   -> kept as-is (float)
 
-    Matching logic (mirrors the social media join):
-        driver = gold_df["target_driver"]  (3-letter abbreviation)
-        year   = gold_df["race_year"]
-        month  = calendar month of gold_df["race_date"]
-
-    All joined columns are prefixed with "radio_" to avoid collisions.
-    Missing matches are left as NaN. A "radio_data_available" (0/1) column
-    is always added so the model can distinguish missing from zero.
+    All output columns are prefixed "radio_".
+    "radio_data_available" (0/1) marks rows where a radio event was matched.
+    All non-matched rows have NaN for every radio column.
     """
-    radio_dir = _get_radio_file()
+    import numpy as np
 
-    if not radio_dir.exists():
-        logging.warning(f"Radio silver directory not found at {radio_dir}. Skipping radio join.")
+    radio_path = _get_radio_file()
+
+    if not radio_path.exists():
+        logging.warning(f"radio.parquet not found at {radio_path}. Skipping radio join.")
         gold_df["radio_data_available"] = 0
         return gold_df
 
     try:
-        radio_df = pd.read_parquet(radio_dir)
+        radio_df = pd.read_parquet(radio_path)
     except Exception as e:
-        logging.warning(f"Could not read radio parquet at {radio_dir}: {e}. Skipping radio join.")
+        logging.warning(f"Could not read radio.parquet: {e}. Skipping radio join.")
         gold_df["radio_data_available"] = 0
         return gold_df
 
     if radio_df.empty:
-        logging.warning("Radio silver parquet is empty. Skipping radio join.")
+        logging.warning("radio.parquet is empty. Skipping radio join.")
         gold_df["radio_data_available"] = 0
         return gold_df
 
-    # --- Parse date and derive grouping keys ---
-    radio_df["date"] = pd.to_datetime(radio_df["date"], utc=True, errors="coerce")
-    radio_df["_year"]  = radio_df["date"].dt.year.astype("Int64").astype(str)
-    radio_df["_month"] = radio_df["date"].dt.month.astype("Int64").astype(str)
-
-    # --- Dynamically infer which columns to aggregate ---
-    # Exclude all metadata / key / partition columns — aggregate everything else
-    metadata_cols = {
-        "date", "driver_number", "driver_abb",
-        "_year", "_month",
-        "year", "month",   # partition columns pandas re-adds on read
-    }
-    group_cols = ["driver_abb", "_year", "_month"]
-
-    agg_cols = [
-        c for c in radio_df.columns
-        if c not in metadata_cols
-        and pd.api.types.is_numeric_dtype(radio_df[c])
+    # -- 1. Drop pure metadata columns ------------------------------------------
+    drop_cols = [
+        "session_key", "meeting_key", "driver_number",
+        "recording_time", "recording_url", "transcript_cleaned",
     ]
+    radio_df = radio_df.drop(columns=[c for c in drop_cols if c in radio_df.columns])
 
-    if not agg_cols:
-        logging.warning(
-            "Radio parquet loaded but no numeric feature columns found. "
-            "Skipping radio join — teammate's feature engineering may not be complete yet."
+    # -- 2. Encode categorical columns ------------------------------------------
+    # transcript_quality: ordinal -> numeric
+    quality_map = {"low": 0, "medium": 1, "high": 2}
+    if "transcript_quality" in radio_df.columns:
+        radio_df["transcript_quality"] = radio_df["transcript_quality"].map(quality_map)
+
+    # Standard categoricals -> one-hot
+    ohe_cols = [c for c in [
+        "primary_event_type",
+        "action_type",
+        "car_issue_signal.issue_type",
+        "car_issue_signal.severity",
+    ] if c in radio_df.columns]
+    radio_df = pd.get_dummies(radio_df, columns=ohe_cols, prefix=ohe_cols, dtype=float)
+
+    # secondary_event_types is a list-per-row -> explode then pivot back
+    if "secondary_event_types" in radio_df.columns:
+        radio_df = radio_df.reset_index(drop=True)
+        radio_df["_row_idx"] = radio_df.index
+
+        sec_exploded = (
+            radio_df[["_row_idx", "secondary_event_types"]]
+            .explode("secondary_event_types")
         )
-        gold_df["radio_data_available"] = 0
-        return gold_df
+        sec_exploded["secondary_event_types"] = (
+            sec_exploded["secondary_event_types"].fillna("none")
+        )
+        sec_dummies = pd.get_dummies(
+            sec_exploded["secondary_event_types"],
+            prefix="secondary_event_type",
+            dtype=float,
+        )
+        # Sum across exploded rows -> multi-hot vector per original row, capped at 1
+        sec_dummies = (
+            pd.concat([sec_exploded[["_row_idx"]], sec_dummies], axis=1)
+            .groupby("_row_idx", as_index=True)
+            .sum()
+            .clip(upper=1)
+        )
+        # Drop the "none" dummy -- empty list indicator, not a real event type
+        none_col = "secondary_event_type_none"
+        if none_col in sec_dummies.columns:
+            sec_dummies = sec_dummies.drop(columns=[none_col])
 
-    logging.info(f"Radio join: aggregating {len(agg_cols)} feature columns dynamically.")
+        radio_df = (
+            radio_df.drop(columns=["secondary_event_types"])
+            .join(sec_dummies, on="_row_idx")
+            .drop(columns=["_row_idx"])
+        )
 
-    # --- Aggregate: mean per (driver, year, month) + raw event count ---
-    radio_agg = (
-        radio_df[group_cols + agg_cols]
-        .groupby(group_cols, as_index=False)[agg_cols]
-        .mean()
-        .round(4)
-    )
+    # -- 3. Rename radio_session_time -> session_time for the asof join ----------
+    radio_df = radio_df.rename(columns={"radio_session_time": "session_time"})
 
-    radio_event_counts = (
-        radio_df.groupby(group_cols, as_index=False)
-        .size()
-        .rename(columns={"size": "radio_event_count"})
-    )
-    radio_agg = radio_agg.merge(radio_event_counts, on=group_cols, how="left")
+    # -- 4. Prefix all feature columns with "radio_" ----------------------------
+    join_keys = {"year", "driver_abb", "grand_prix_name", "session_time"}
+    rename_map = {c: f"radio_{c}" for c in radio_df.columns if c not in join_keys}
+    radio_df = radio_df.rename(columns=rename_map)
+    radio_feature_cols = [c for c in radio_df.columns if c not in join_keys]
 
-    # Prefix all feature columns with "radio_"
-    rename_map = {c: f"radio_{c}" for c in agg_cols}
-    radio_agg = radio_agg.rename(columns=rename_map)
-    radio_feature_cols = [f"radio_{c}" for c in agg_cols] + ["radio_event_count"]
+    # -- 5. Ensure session_time is float and sort for merge_asof ----------------
+    radio_df["session_time"] = pd.to_numeric(radio_df["session_time"], errors="coerce")
+    gold_df["session_time"]  = pd.to_numeric(gold_df["session_time"],  errors="coerce")
 
-    # --- Build fast lookup: (driver_abb, year_str, month_str) -> row ---
-    radio_lookup = {
-        (row["driver_abb"], row["_year"], row["_month"]): row
-        for _, row in radio_agg.iterrows()
-    }
-
-    # --- Derive year / month from gold_df race_date ---
-    if "race_date" in gold_df.columns:
-        race_dates   = pd.to_datetime(gold_df["race_date"], errors="coerce")
-        year_series  = race_dates.dt.year.astype("Int64").astype(str)
-        month_series = race_dates.dt.month.astype("Int64").astype(str)
-    else:
-        year_series  = gold_df["race_year"].astype(str)
-        month_series = pd.Series([""] * len(gold_df), index=gold_df.index)
-
-    driver_series = gold_df["target_driver"].astype(str).str.upper()
-
-    # --- Join radio features onto gold_df ---
+    # -- 6. Initialise all radio columns as NaN / 0 in gold ---------------------
+    # Only new radio_* columns are touched here. Every existing gold column
+    # (telemetry, position, tyre data, etc.) is completely unaffected — now and
+    # at every point below. We write back via the original DataFrame index only.
     for col in radio_feature_cols:
         gold_df[col] = float("nan")
     gold_df["radio_data_available"] = 0
 
-    for i, (driver, year, month) in enumerate(zip(driver_series, year_series, month_series)):
-        matched_row = radio_lookup.get((driver, year, month))
-        if matched_row is not None:
-            for col in radio_feature_cols:
-                if col in matched_row:
-                    gold_df.at[gold_df.index[i], col] = matched_row[col]
-            gold_df.at[gold_df.index[i], "radio_data_available"] = 1
+    # -- 7. Per-group nearest-neighbour asof join — in-place index writes --------
+    # We iterate per (driver, year, race_location) so merge_asof never crosses
+    # race or driver boundaries.
+    # Results are written back into gold_df using .loc[original_index] so:
+    #   - No rows are ever added or dropped
+    #   - No existing column is ever overwritten
+    #   - Groups with no radio data stay exactly as initialised (radio cols = NaN)
+    gold_df["race_year"] = gold_df["race_year"].astype(str)
+    total_matched = 0
 
-    matched = int(gold_df["radio_data_available"].sum())
+    for (driver, year, location), gold_group in gold_df.groupby(
+        ["target_driver", "race_year", "race_location"], sort=False
+    ):
+        # Pull matching radio events for this driver / year / GP
+        radio_group = radio_df[
+            (radio_df["driver_abb"] == driver)
+            & (radio_df["year"].astype(str) == str(year))
+            & (radio_df["grand_prix_name"] == location)
+        ].copy()
+
+        # No radio data for this group — existing gold rows untouched, radio cols
+        # remain NaN as initialised. Nothing to do.
+        if radio_group.empty:
+            continue
+
+        # Sort both sides on session_time (required by merge_asof)
+        gold_sorted  = gold_group.sort_values("session_time")
+        radio_sorted = (
+            radio_group[["session_time"] + radio_feature_cols]
+            .sort_values("session_time")
+            .copy()
+        )
+
+        # merge_asof (nearest): temporarily fills every gold row with its closest
+        # radio event so we can compute the distance matrix. We use the sorted
+        # gold index to map results back — the original gold_df index is preserved
+        # as the index of gold_sorted (sort_values does not reset index).
+        merged = pd.merge_asof(
+            gold_sorted.reset_index(),   # carry original index as a column
+            radio_sorted,
+            on="session_time",
+            direction="nearest",
+            suffixes=("", "_radio_tmp"),
+        )
+        # 'index' column now holds the original gold_df row labels
+        original_idx  = merged["index"].values
+        gold_times    = merged["session_time"].values
+        radio_times   = radio_sorted["session_time"].values
+
+        # Distance matrix: shape (n_gold_rows, n_radio_events)
+        diffs = np.abs(gold_times[:, None] - radio_times[None, :])
+
+        # For each radio event find the single gold row it is closest to
+        nearest_gold_pos = diffs.argmin(axis=0)   # one position per radio event
+
+        # Write radio feature values directly into gold_df at the matched index labels.
+        # Every other row keeps its NaN — no loop, no concat, no reindex risk.
+        for radio_col in radio_feature_cols:
+            if radio_col in merged.columns:
+                gold_df.loc[
+                    original_idx[nearest_gold_pos], radio_col
+                ] = merged[radio_col].iloc[nearest_gold_pos].values
+
+        gold_df.loc[original_idx[nearest_gold_pos], "radio_data_available"] = 1
+        total_matched += len(nearest_gold_pos)
+
     logging.info(
-        f"Radio join complete: {matched}/{len(gold_df)} rows matched "
-        f"({matched / len(gold_df) * 100:.1f}%)"
+        f"Radio join complete: {total_matched} session_time rows matched | "
+        f"{len(radio_feature_cols)} radio feature columns added. "
+        f"All {len(gold_df)} gold rows intact — non-matched rows have NaN radio columns only."
     )
 
     return gold_df
