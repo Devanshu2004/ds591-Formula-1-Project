@@ -21,7 +21,7 @@ cache/
 *.log
 
 team_radio/
-
+.claude/
 .python_packages
 
 cache/*

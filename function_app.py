@@ -326,11 +326,10 @@ def run_radio_silver(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             body = {}
 
-        session_key   = body.get("session_key", None)
-        whisper_model = body.get("whisper_model", "base")
+        session_key = body.get("session_key", None)
 
         from src.radio_data import run_radio_silver as _run_radio_silver
-        result = _run_radio_silver(session_key=session_key, whisper_model_size=whisper_model)
+        result = _run_radio_silver(session_key=session_key)
 
         return json_response({
             "status": "success",
