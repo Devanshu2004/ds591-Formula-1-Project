@@ -1,0 +1,12 @@
+numpy
+pandas
+fastf1
+pyarrow
+requests
+azure-eventhub
+azure-functions
+certifi
+fsspec
+adlfs
+textblob
+scikit-learn
