@@ -9,4 +9,5 @@ certifi
 fsspec
 adlfs
 textblob
+azure-functions-durable
 scikit-learn

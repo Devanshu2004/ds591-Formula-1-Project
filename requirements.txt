@@ -6,6 +6,7 @@ requests
 matplotlib
 scipy
 azure-eventhub
+azure-functions-durable
 azure-functions
 certifi
 fsspec

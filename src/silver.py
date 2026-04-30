@@ -8,6 +8,7 @@ import fsspec
 
 
 # --------------------------- Configuration ------------------------------
+# default values
 YEARS_ENV = os.getenv("YEARS", "2024,2025")
 YEARS = [int(y.strip()) for y in YEARS_ENV.split(",") if y.strip()]
 
@@ -223,12 +224,13 @@ def add_race_date(df: pd.DataFrame) -> pd.DataFrame:
     df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
     return df
 
-
 def clean_gear_column(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    #remove invalid values and fill missing (smooth driving assumption)
     df["gear"] = pd.to_numeric(df["gear"], errors="coerce")
     df.loc[~df["gear"].between(0, 8), "gear"] = pd.NA
     df["gear"] = df["gear"].ffill().bfill()
+
     return df
 
 
@@ -384,6 +386,7 @@ def load_race_data(
         return pd.DataFrame()
 
     race_df = pd.concat(driver_frames, ignore_index=True, sort=False)
+
     race_df = add_race_date(race_df)
 
     min_time = race_df["session_time"].min()
@@ -392,8 +395,7 @@ def load_race_data(
     logging.info(f"Final silver race shape for {race_location}: {race_df.shape}")
     return race_df
 
-
-# ── ONLY CHANGE FROM ORIGINAL: writes to Azure instead of local disk ───────────
+# Uncomment to write to azure 
 def write_race_output(
     race_df: pd.DataFrame,
     race_year: int,
@@ -406,10 +408,31 @@ def write_race_output(
         silver_container,
         f"{race_year}/{SESSION_TYPE}/{safe_location}.parquet"
     )
+
     race_df.to_parquet(output_file, index=False, storage_options=storage_options)
-    logging.info(f"Saved silver to Azure: {output_file}")
+
+    logging.info(f"Saved: {output_file}")
     return output_file
 
+
+"""def write_race_output(
+    race_df: pd.DataFrame,
+    race_year: int,
+    race_location: str,
+    silver_container: str,
+    storage_options: dict
+) -> str:
+    safe_location = re.sub(r"[^\w]+", "_", race_location).strip("_")
+
+    local_root = "data/silver"
+    output_dir = os.path.join(local_root, str(race_year), SESSION_TYPE)
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_file = os.path.join(output_dir, f"{safe_location}.parquet")
+    race_df.to_parquet(output_file, index=False)
+
+    logging.info(f"Saved silver locally: {output_file}")
+    return output_file"""
 
 def run_silver_pipeline(
     year: Optional[int] = None,
@@ -491,7 +514,6 @@ def run_silver_pipeline(
         logging.warning("No silver files created")
 
     return output_files
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
