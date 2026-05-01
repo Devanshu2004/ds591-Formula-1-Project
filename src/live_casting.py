@@ -70,7 +70,7 @@ GRAND_PRIX   = os.environ.get("F1_GRAND_PRIX", "Japanese Grand Prix")   # FastF1
 SESSION_TYPE = os.environ.get("F1_SESSION_TYPE", "R")     # Q / R / FP1 / FP2 / FP3
 
 LIVE_DATA_FILE = "live_timing_data.txt"
-POLL_INTERVAL  = 10   # seconds between polls (keep 10–15 to avoid file contention)
+POLL_INTERVAL  = 5    # seconds — push a full grid snapshot every 5 seconds
 
 # Azure Event Hub — key name matches local.settings.json: EVENT_HUB_CONNECTION_STRING
 EVENT_HUB_CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
@@ -303,56 +303,51 @@ def record_live_session():
 # ==============================
 def poll_and_push():
     """
-    Periodically reloads the growing live data file using LiveTimingData,
-    extracts all available data, and pushes incremental updates to Azure Event Hub.
+    Runs every POLL_INTERVAL seconds and pushes a full grid snapshot to Event Hub.
+
+    No de-duplication — we push every cycle unconditionally.
+    Within a lap, data is constantly changing: sector times update mid-lap,
+    positions swap on track, speed traps fire at different moments per driver.
+    Filtering by "new lap only" would give you one update per ~90 seconds,
+    which defeats the purpose of a live dashboard.
+
+    Each push sends one record per driver (20 records total), all timestamped
+    to the exact second of the poll. Stream Analytics passes them straight
+    through to Power BI, which always shows the freshest value per driver.
     """
     log.info("Polling loop started. Waiting for data file to appear...")
-
-    last_lap_count = 0
-    last_result_count = 0
 
     while True:
         time.sleep(POLL_INTERVAL)
 
         try:
-            # Discover all data files (handles reconnection parts too)
+            # Discover all data files (handles reconnection multi-part files)
             data_files = sorted(Path(".").glob("live_timing_data*.txt"))
             if not data_files:
                 log.info("No data file found yet. Waiting...")
                 continue
 
             file_paths = [str(f) for f in data_files]
-            log.debug(f"Loading files: {file_paths}")
 
-            # Load all available live timing data
+            # Reload the full file on every poll — LiveTimingData is stateless
             livedata = LiveTimingData(*file_paths)
-
-            session = fastf1.get_session(YEAR, GRAND_PRIX, SESSION_TYPE)
+            session  = fastf1.get_session(YEAR, GRAND_PRIX, SESSION_TYPE)
             session.load(
                 livedata=livedata,
                 laps=True,
-                telemetry=False,   # Disable telemetry — huge data, slows polling
-                weather=True,
-                messages=True
+                telemetry=False,  # keep off — high volume, slows the poll cycle
+                weather=False,
+                messages=False,
             )
 
-            # --- Laps ---
-            laps_data = extract_laps_data(session)
-            if len(laps_data) > last_lap_count:
-                new_records = laps_data[last_lap_count:]
-                push_to_event_hub(new_records, label="laps")
-                last_lap_count = len(laps_data)
-                log.info(f"Pushed {len(new_records)} new lap records ({len(laps_data)} total).")
-            else:
-                log.info(f"No new lap data since last poll ({last_lap_count} records total).")
+            # One record per driver, right now
+            snapshot = extract_laps_data(session)
+            if not snapshot:
+                log.info("No lap data available yet — session may not have started.")
+                continue
 
-            # --- Results (available after session ends) ---
-            results_data = extract_results_data(session)
-            if len(results_data) > last_result_count:
-                new_results = results_data[last_result_count:]
-                push_to_event_hub(new_results, label="results")
-                last_result_count = len(results_data)
-                log.info(f"Pushed {len(new_results)} new result records.")
+            log.info(f"Pushing snapshot: {len(snapshot)} drivers @ {datetime.utcnow().isoformat()}")
+            push_to_event_hub(snapshot, label="live snapshot")
 
         except FileNotFoundError:
             log.info("Data file not ready yet. Waiting...")

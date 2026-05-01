@@ -114,15 +114,19 @@ def json_response(payload: dict, status_code: int = 200) -> func.HttpResponse:
 @app.route(route="run_live", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def run_live(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Manually triggers a live data fetch.
-    POST /api/run_live
+    Starts the live F1 timing pipeline:
+        SignalRClient (records to .txt) + poll thread (pushes to Event Hub every N seconds)
 
+    POST /api/run_live
     Optional JSON body:
     {
-      "year": "2026",
-      "gp": "Japanese Grand Prix",
-      "session": "R"
+      "year":         "2026",
+      "gp":           "Japanese Grand Prix",
+      "session_type": "R"
     }
+
+    NOTE: This call blocks for the full duration of the session (up to ~2 hrs for a race).
+    Set "functionTimeout": "02:30:00" in host.json, or run live_casting.py locally instead.
     """
     logging.info("run_live HTTP trigger fired")
 
@@ -132,42 +136,36 @@ def run_live(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             body = {}
 
-        year = body.get("year", get_env("F1_YEAR", "2026"))
-        gp = body.get("gp", get_env("F1_GRAND_PRIX", "Japanese Grand Prix"))
-        session = body.get("session", get_env("F1_SESSION_TYPE", "R"))
+        year         = body.get("year",         get_env("F1_YEAR",         "2026"))
+        gp           = body.get("gp",           get_env("F1_GRAND_PRIX",   "Japanese Grand Prix"))
+        session_type = body.get("session_type", get_env("F1_SESSION_TYPE", "R"))
 
-        username = get_env("F1_USERNAME", required=True)
-        password = get_env("F1_PASSWORD", required=True)
-        storage_account = get_env("STORAGE_ACCOUNT_NAME", required=True)
-        storage_key = get_env("STORAGE_ACCOUNT_KEY", required=True)
-        container = get_env("ADLS_CONTAINER", required=True)
-        directory = get_env("ADLS_DIRECTORY", required=True)
+        # Validate credentials — fail fast before starting the long-running process
+        get_env("F1_USERNAME",                required=True)
+        get_env("F1_PASSWORD",                required=True)
+        get_env("EVENT_HUB_CONNECTION_STRING", required=True)
+        get_env("EVENT_HUB_NAME",             required=True)
 
-        from src.fetch_data import run_live_fetch
-        run_live_fetch(
-            year=year,
-            gp=gp,
-            session=session,
-            username=username,
-            password=password,
-            storage_account=storage_account,
-            storage_key=storage_key,
-            container=container,
-            directory=directory
-        )
+        # Push any body overrides into env so live_casting.py reads them
+        os.environ["F1_YEAR"]         = str(year)
+        os.environ["F1_GRAND_PRIX"]   = str(gp)
+        os.environ["F1_SESSION_TYPE"] = str(session_type)
+
+        from src.live_casting import main as live_casting_main
+        live_casting_main()   # blocks until session ends
 
         return json_response({
-            "status": "success",
-            "message": "Live fetch completed",
-            "year": year,
-            "gp": gp,
-            "session": session
+            "status":  "success",
+            "message": "Live session pipeline completed",
+            "year":    year,
+            "gp":      gp,
+            "session": session_type,
         }, 200)
 
     except Exception as e:
         logging.exception(f"run_live failed: {e}")
         return json_response({
-            "status": "error",
+            "status":  "error",
             "message": str(e)
         }, 500)
 

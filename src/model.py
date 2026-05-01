@@ -88,8 +88,8 @@ LSTM_HIDDEN_SIZE   = 64
 LSTM_LAYERS        = 2
 EMBEDDING_DIM      = 32
 DROPOUT            = 0.3
-BATCH_SIZE         = 32
-EPOCHS             = 50
+BATCH_SIZE         = 512
+EPOCHS             = 20
 LEARNING_RATE      = 1e-3
 NUM_POSITIONS      = 20
 
@@ -265,14 +265,11 @@ def load_driver_parquet(driver: str) -> Optional[pd.DataFrame]:
 
 
 def save_model_to_azure(local_path: str, blob_name: str):
-    """Upload local model file to platinum/models/"""
-    try:
-        fs     = get_fs()
-        remote = blob_path(MODEL_CONTAINER, blob_name)
-        fs.put(local_path, remote)
-        logging.info(f"Uploaded: {MODEL_CONTAINER}/{blob_name}")
-    except Exception as e:
-        logging.warning(f"Could not upload {blob_name}: {e}")
+    """
+    Upload local model file to platinum/models/.
+    Currently disabled for local training — upload model_weights/ to Azure manually.
+    """
+    logging.info(f"Azure upload skipped (local mode): {blob_name}")
 
 
 def load_model_from_azure(blob_name: str, local_path: str):
@@ -392,6 +389,18 @@ class DriverDataset(Dataset):
             f"input_size={len(self.feature_cols)} | "
             f"radio_dim={len(self.radio_cols) or 1}"
         )
+
+        # Subsample to max 100k sequences for local training on M4
+        MAX_SEQS = 100_000
+        if len(self.sequences) > MAX_SEQS:
+            import random
+            indices = random.sample(range(len(self.sequences)), MAX_SEQS)
+            self.sequences       = [self.sequences[i]       for i in indices]
+            self.targets         = [self.targets[i]         for i in indices]
+            self.social_scores   = [self.social_scores[i]   for i in indices]
+            self.radio_sequences = [self.radio_sequences[i] for i in indices]
+            self.radio_gates     = [self.radio_gates[i]     for i in indices]
+            logging.info(f"Subsampled to {MAX_SEQS} sequences for local training")
 
     def __len__(self):
         return len(self.sequences)
@@ -652,7 +661,7 @@ def extract_embeddings(
             logging.warning(f"Skipping {driver} — no data")
             continue
 
-        ckpt  = torch.load(local_path, map_location=device)
+        ckpt  = torch.load(local_path, map_location=device, weights_only=False)
         model = DriverChannel(
             input_size=ckpt["input_size"],
             radio_dim=ckpt["radio_dim"],
@@ -763,7 +772,7 @@ def load_channel(
         logging.warning(f"No saved channel for {driver}")
         return None
 
-    ckpt  = torch.load(local_path, map_location=device)
+    ckpt  = torch.load(local_path, map_location=device, weights_only=False)
     model = DriverChannel(
         input_size=ckpt["input_size"],
         radio_dim=ckpt["radio_dim"],
@@ -880,7 +889,7 @@ if __name__ == "__main__":
     )
 
     SAVE_DIR = "./model_weights"
-    DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     logging.info(f"Device             : {DEVICE}")
     logging.info(f"Session type       : {SESSION_TYPE}")
