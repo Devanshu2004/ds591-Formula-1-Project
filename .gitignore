@@ -1,3 +1,6 @@
+# ffmpeg static binary (Linux x64 — committed for Azure deployment)
+# bin/ffmpeg_linux  <-- intentionally tracked, do not ignore
+
 # Secrets and Config
 local.settings.json
 .env

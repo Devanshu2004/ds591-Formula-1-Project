@@ -375,3 +375,23 @@ def run_model(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception(f"run_model failed: {e}")
         return json_response({"status": "error", "message": str(e)}, 500)
+
+
+# ── RADIO: LIVE ────────────────────────────────────────────────────────────────
+# Fires every 15 seconds during a race.
+# Each firing polls OpenF1 for new recordings, transcribes via Azure Speech,
+# classifies, and appends to silver/radio_live.parquet.
+# Token refresh is handled automatically inside run_radio_live().
+# Enable by setting run_on_startup=True or deploying during an active race weekend.
+@app.timer_trigger(schedule="*/15 * * * * *", arg_name="mytimer", run_on_startup=False)
+def radio_live(mytimer: func.TimerRequest) -> None:
+    if mytimer.past_due:
+        logging.info("radio_live timer is past due")
+
+    logging.info("radio_live timer fired — polling OpenF1 for new radio recordings")
+
+    try:
+        from src.radio_data import run_radio_live
+        run_radio_live(poll_interval=0)  # poll_interval=0 since timer handles the cadence
+    except Exception as e:
+        logging.exception(f"radio_live failed: {e}")

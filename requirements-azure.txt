@@ -10,3 +10,4 @@ fsspec
 adlfs
 textblob
 scikit-learn
+paho-mqtt

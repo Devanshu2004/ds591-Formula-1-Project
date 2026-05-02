@@ -535,86 +535,259 @@ def run_radio_silver(session_key=None):
     return {"Status": "Success", "Year": nested}
 
 
-# --- 8. Live Layer ---
-# def run_radio_live(session_key, poll_interval=10):
-#     """
-#     Live mode: poll OpenF1 for new radio, transcribe with Azure Speech Services,
-#     classify, and push events to Azure Event Hub.
-#     Requires: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
-#               EVENT_HUB_CONNECTION_STRING, EVENT_HUB_NAME
-#     """
-#     import time
-#     speech_key    = os.getenv("AZURE_SPEECH_KEY", "")
-#     speech_region = os.getenv("AZURE_SPEECH_REGION", "")
-#     eh_conn       = os.getenv("EVENT_HUB_CONNECTION_STRING", "")
-#     eh_name       = os.getenv("EVENT_HUB_NAME", "")
+# --- 9. Live Layer ---
+# Requires env vars:
+#   OPENF1_EMAIL, OPENF1_PASSWORD   — OpenF1 OAuth credentials
+#   AZURE_SPEECH_KEY                — Azure Speech Services key
+#   AZURE_SPEECH_REGION             — Azure Speech Services region (e.g. "eastus")
+#   SILVER_CONTAINER                — Azure container for live parquet output
 #
-#     if not speech_key:
-#         log.error("AZURE_SPEECH_KEY is required for live mode.")
-#         return
-#
-#     def _transcribe_azure(audio_bytes):
-#         endpoint = (
-#             f"https://{speech_region}.stt.speech.microsoft.com"
-#             "/speech/recognition/conversation/cognitiveservices/v1?language=en-US"
-#         )
-#         headers = {
-#             "Ocp-Apim-Subscription-Key": speech_key,
-#             "Content-Type": "audio/mpeg",
-#             "Accept": "application/json",
-#         }
-#         resp = requests.post(endpoint, headers=headers, data=audio_bytes, timeout=30)
-#         resp.raise_for_status()
-#         result = resp.json()
-#         return result.get("DisplayText", "").strip() if result.get("RecognitionStatus") == "Success" else None
-#
-#     def _push_to_event_hub(events):
-#         if not eh_conn or not eh_name:
-#             log.warning("[DRY RUN] Would push %d events.", len(events))
-#             return
-#         from azure.eventhub import EventHubProducerClient, EventData
-#         producer = EventHubProducerClient.from_connection_string(eh_conn, eventhub_name=eh_name)
-#         with producer:
-#             batch = producer.create_batch()
-#             for ev in events:
-#                 try:
-#                     batch.add(EventData(json.dumps(ev, default=str)))
-#                 except ValueError:
-#                     producer.send_batch(batch)
-#                     batch = producer.create_batch()
-#                     batch.add(EventData(json.dumps(ev, default=str)))
-#             producer.send_batch(batch)
-#         log.info("Pushed %d events to Event Hub.", len(events))
-#
-#     seen_urls = set()
-#     log.info("Starting live radio polling for session %s (interval: %ds)...", session_key, poll_interval)
-#     try:
-#         while True:
-#             try:
-#                 radio = fetch_team_radio(session_key=session_key)
-#             except Exception as e:
-#                 log.error("Fetch failed: %s", e)
-#                 time.sleep(poll_interval)
-#                 continue
-#
-#             new_rows = radio[~radio["recording_url"].isin(seen_urls)]
-#             events = []
-#             for _, row in new_rows.iterrows():
-#                 url = row["recording_url"]
-#                 seen_urls.add(url)
-#                 try:
-#                     r = requests.get(url, timeout=30)
-#                     r.raise_for_status()
-#                 except Exception:
-#                     continue
-#                 transcript = _transcribe_azure(r.content)
-#                 if transcript:
-#                     events.append(classify_radio(transcript, row.to_dict()))
-#             if events:
-#                 _push_to_event_hub(events)
-#             time.sleep(poll_interval)
-#     except KeyboardInterrupt:
-#         log.info("Live polling stopped.")
+# Wire as Timer Trigger in function_app.py — fires every 15 seconds during race:
+#   @app.timer_trigger(schedule="*/15 * * * * *", arg_name="mytimer", run_on_startup=False)
+#   def radio_live(mytimer): run_radio_live()
+
+# Module-level token cache so we don't re-fetch every 15-second firing
+_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+
+def _get_openf1_token() -> str:
+    """Return a valid OpenF1 OAuth2 token, refreshing only when within 60s of expiry."""
+    import time as _time
+    if _token_cache["token"] is None or _time.time() >= _token_cache["expires_at"] - 60:
+        resp = requests.post(
+            "https://api.openf1.org/token",
+            data={
+                "username": os.getenv("OPENF1_EMAIL"),
+                "password": os.getenv("OPENF1_PASSWORD"),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _token_cache["token"]      = data["access_token"]
+        _token_cache["expires_at"] = _time.time() + int(data.get("expires_in", 3600))
+        log.info("OpenF1 token refreshed — valid for %d min", int(data.get("expires_in", 3600)) // 60)
+    return _token_cache["token"]
+
+
+def _transcribe_azure_speech(audio_bytes: bytes) -> str | None:
+    """
+    Transcribe MP3 bytes via Azure Speech REST API.
+    Converts MP3 → WAV (16kHz mono PCM) first — Azure Speech REST requires WAV.
+    Returns transcript text or None.
+    """
+    import subprocess
+    import tempfile
+
+    speech_key    = os.getenv("AZURE_SPEECH_KEY", "")
+    speech_region = os.getenv("AZURE_SPEECH_REGION", "")
+
+    # Resolve ffmpeg: use bundled Linux binary on Azure, system ffmpeg locally
+    _here   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _linux  = os.path.join(_here, "bin", "ffmpeg_linux")
+    ffmpeg  = _linux if os.path.isfile(_linux) else "ffmpeg"
+
+    # Convert MP3 → WAV via ffmpeg
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        mp3_path = tmp.name
+    wav_path = mp3_path.replace(".mp3", ".wav")
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", mp3_path,
+             "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", wav_path],
+            capture_output=True, check=True,
+        )
+        wav_bytes = open(wav_path, "rb").read()
+    except Exception as e:
+        log.warning("ffmpeg conversion failed: %s", e)
+        return None
+    finally:
+        for p in (mp3_path, wav_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    resp = requests.post(
+        f"https://{speech_region}.stt.speech.microsoft.com"
+        "/speech/recognition/conversation/cognitiveservices/v1"
+        "?language=en-US&format=simple",
+        headers={
+            "Ocp-Apim-Subscription-Key": speech_key,
+            "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
+            "Accept":       "application/json",
+        },
+        data=wav_bytes,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if result.get("RecognitionStatus") == "Success":
+        return result.get("DisplayText", "").strip() or None
+    return None
+
+
+def run_radio_live(poll_interval: int = 0) -> None:
+    """
+    Called by the Azure Timer Trigger every 15 seconds during a race.
+
+    Each firing:
+      1. Gets a valid OpenF1 token (refreshes automatically when near expiry)
+      2. Opens an MQTT connection to OpenF1, subscribes to v1/team_radio only
+      3. Listens for 13 seconds, collecting incoming radio payloads
+      4. Disconnects, then for each new recording:
+           - Downloads the MP3
+           - Transcribes via Azure Speech Services
+           - Classifies + enriches to match silver/radio.parquet schema
+      5. Appends new rows to silver/radio_live.parquet on ADLS
+
+    Output schema matches silver/radio.parquet so live data can be merged
+    with historical data after the race.
+    """
+    import ssl
+    import time
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import adlfs
+
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        log.error("paho-mqtt not installed — run: pip install paho-mqtt")
+        return
+
+    speech_key = os.getenv("AZURE_SPEECH_KEY", "")
+    if not speech_key:
+        log.error("AZURE_SPEECH_KEY is required — check local.settings.json")
+        return
+
+    silver_container = os.getenv("SILVER_CONTAINER", "silver")
+    fs       = adlfs.AzureBlobFileSystem(**get_storage_options())
+    live_path = f"{silver_container}/radio_live.parquet"
+
+    # Load seen URLs + existing rows from ADLS (survives restarts)
+    seen_urls   = set()
+    existing_df = None
+    try:
+        with fs.open(live_path, "rb") as fh:
+            existing_df = pq.read_table(fh).to_pandas()
+            seen_urls   = set(existing_df["recording_url"].tolist())
+            log.info("Resumed: %d previously processed recordings", len(seen_urls))
+    except Exception:
+        log.info("No existing radio_live.parquet — starting fresh")
+
+    # Fetch session start times for radio_session_time calculation
+    session_starts = _fetch_session_starts()
+
+    # ── MQTT: connect → subscribe v1/team_radio → listen 13s → disconnect ────
+    token     = _get_openf1_token()
+    collected = []   # raw payloads from MQTT
+
+    def on_connect(client, _userdata, _flags, reason_code, _properties):
+        rc = reason_code.value if hasattr(reason_code, "value") else int(reason_code)
+        if rc == 0:
+            client.subscribe("v1/team_radio", qos=0)
+            log.info("MQTT connected — subscribed to v1/team_radio")
+        else:
+            log.error("MQTT connect failed: %s", reason_code)
+
+    def on_message(_client, _userdata, msg):
+        try:
+            payload = json.loads(msg.payload)
+            if isinstance(payload, dict):
+                collected.append(payload)
+                log.info("MQTT radio received: driver=%s", payload.get("driver_number"))
+        except Exception as exc:
+            log.warning("Could not parse MQTT message: %s", exc)
+
+    def on_disconnect(_client, _userdata, _flags, reason_code, _properties):
+        log.info("MQTT disconnected: %s", reason_code)
+
+    client_id = f"radio-live-{int(time.time())}"
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt.MQTTv5)
+    client.on_connect    = on_connect
+    client.on_message    = on_message
+    client.on_disconnect = on_disconnect
+    client.username_pw_set(username=token, password=None)
+    client.tls_set_context(ssl.create_default_context())
+    client.reconnect_delay_set(min_delay=1, max_delay=5)
+
+    try:
+        client.connect("mqtt.openf1.org", 8883, keepalive=30)
+        client.loop_start()
+        time.sleep(13)   # timer fires every 15s; 2s left for processing
+        client.loop_stop()
+        client.disconnect()
+    except Exception as e:
+        log.error("MQTT error: %s", e)
+        return
+
+    if not collected:
+        log.info("No radio messages received this cycle")
+        return
+
+    new_recordings = [r for r in collected if r.get("recording_url") not in seen_urls]
+    if not new_recordings:
+        log.info("All %d received message(s) already processed", len(collected))
+        return
+
+    log.info("%d new recording(s) to process", len(new_recordings))
+
+    # ── Download → Transcribe → Classify each new recording ──────────────────
+    new_events = []
+    for record in new_recordings:
+        url = record.get("recording_url", "")
+        if not url:
+            continue
+        seen_urls.add(url)
+
+        try:
+            audio_resp = requests.get(url, timeout=30)
+            audio_resp.raise_for_status()
+            audio_bytes = audio_resp.content
+        except Exception as e:
+            log.warning("Could not download %s: %s", url, e)
+            continue
+
+        transcript = _transcribe_azure_speech(audio_bytes)
+        if not transcript:
+            log.warning("No transcript for %s — skipping", url)
+            continue
+
+        event = classify_radio(transcript, record)
+        event["grand_prix_name"] = _gp_name_from_url(url)
+        event["recording_url"]   = url
+
+        recording_time = pd.to_datetime(record.get("date"), utc=True, errors="coerce")
+        session_key    = record.get("session_key")
+        session_start  = session_starts.get(session_key)
+        event["radio_session_time"] = (
+            round((recording_time - session_start).total_seconds(), 1)
+            if session_start and pd.notna(recording_time) else None
+        )
+
+        new_events.append(event)
+        log.info("Classified: driver=%s  primary=%s  transcript=%s",
+                 event.get("driver_abb"), event.get("primary_event_type"), transcript[:60])
+
+    if not new_events:
+        return
+
+    # ── Append to silver/radio_live.parquet ───────────────────────────────────
+    new_df = pd.json_normalize(new_events)
+    new_df["date"] = pd.to_datetime(new_df.get("date", pd.NaT), utc=True, errors="coerce")
+    new_df = new_df.rename(columns={"date": "recording_time"})
+    new_df["year"] = new_df["recording_time"].dt.year.astype(str)
+    new_df = new_df.drop(columns=["summary", "evidence_phrases", "notes"], errors="ignore")
+
+    combined = pd.concat([existing_df, new_df], ignore_index=True) if existing_df is not None else new_df
+    table    = pa.Table.from_pandas(combined, preserve_index=False)
+    with fs.open(live_path, "wb") as fh:
+        pq.write_table(table, fh)
+
+    log.info("Appended %d events → silver/radio_live.parquet (%d total)",
+             len(new_events), len(combined))
 
 
 if __name__ == "__main__":
@@ -624,13 +797,10 @@ if __name__ == "__main__":
                         help="Pipeline stage to run")
     parser.add_argument("--session-key", type=int, default=None,
                         help="Specific OpenF1 session key (optional)")
-    parser.add_argument("--whisper-model", type=str, default="base",
-                        choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model size for silver transcription")
     args = parser.parse_args()
 
     if args.stage == "bronze":
         run_radio_bronze(session_key=args.session_key)
     elif args.stage == "silver":
-        result = run_radio_silver(session_key=args.session_key, whisper_model_size=args.whisper_model)
+        result = run_radio_silver(session_key=args.session_key)
         print(json.dumps(result, indent=2))
