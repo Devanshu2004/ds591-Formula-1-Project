@@ -15,6 +15,7 @@ venv/
 __pycache__/
 f1_cache/
 cache/
+model_weights/
 
 # OS/IDE files
 .DS_Store
