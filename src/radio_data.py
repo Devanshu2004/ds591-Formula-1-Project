@@ -774,6 +774,42 @@ def run_radio_live(poll_interval: int = 0) -> None:
     if not new_events:
         return
 
+    # ── Send to Event Hub → Stream Analytics → Power BI ──────────────────────
+    eh_conn = os.getenv("EVENT_HUB_CONNECTION_STRING", "")
+    eh_name = "f1-radio"
+    if eh_conn:
+        try:
+            from azure.eventhub import EventHubProducerClient, EventData
+            producer = EventHubProducerClient.from_connection_string(
+                eh_conn, eventhub_name=eh_name
+            )
+            with producer:
+                batch = producer.create_batch()
+                for ev in new_events:
+                    # Flatten nested dicts for Stream Analytics / Power BI
+                    flat = {
+                        "session_key":        ev.get("session_key"),
+                        "driver_number":      ev.get("driver_number"),
+                        "driver_abb":         ev.get("driver_abb"),
+                        "grand_prix_name":    ev.get("grand_prix_name"),
+                        "recording_time":     str(ev.get("date", "")),
+                        "radio_session_time": ev.get("radio_session_time"),
+                        "transcript_cleaned": ev.get("transcript_cleaned"),
+                        "primary_event_type": ev.get("primary_event_type"),
+                        "action_type":        ev.get("action_type"),
+                        "action_required":    ev.get("action_required"),
+                        "confidence":         ev.get("confidence"),
+                        "pit_related":        ev.get("strategy_signal", {}).get("pit_related"),
+                        "tire_related":       ev.get("strategy_signal", {}).get("tire_related"),
+                        "safety_related":     ev.get("strategy_signal", {}).get("safety_related"),
+                        "has_issue":          ev.get("car_issue_signal", {}).get("has_issue"),
+                    }
+                    batch.add(EventData(json.dumps(flat)))
+                producer.send_batch(batch)
+            log.info("Sent %d event(s) to Event Hub %s", len(new_events), eh_name)
+        except Exception as e:
+            log.warning("Event Hub send failed (non-fatal): %s", e)
+
     # ── Append to silver/radio_live.parquet ───────────────────────────────────
     new_df = pd.json_normalize(new_events)
     new_df["date"] = pd.to_datetime(new_df.get("date", pd.NaT), utc=True, errors="coerce")
