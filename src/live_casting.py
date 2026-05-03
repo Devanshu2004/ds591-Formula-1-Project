@@ -43,7 +43,6 @@ from azure.eventhub import EventHubProducerClient, EventData
 import ssl
 import certifi
 ssl._create_default_https_context = ssl.create_default_context
-import os
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
 # ==============================
@@ -66,9 +65,15 @@ log = logging.getLogger("F1Pipeline")
 
 # F1 session config — matches local.settings.json keys exactly
 YEAR         = int(os.environ.get("F1_YEAR", "2026"))
-GRAND_PRIX   = os.environ.get("F1_GRAND_PRIX", "Japanese Grand Prix")   # FastF1 GP name
-SESSION_TYPE = os.environ.get("F1_SESSION_TYPE", "R")     # Q / R / FP1 / FP2 / FP3
+GRAND_PRIX   = os.environ.get("F1_GRAND_PRIX", "Miami Grand Prix")
+SESSION_TYPE = os.environ.get("F1_SESSION_TYPE", "R")
 
+def _reload_config():
+    """Re-read env vars at call time, not import time."""
+    global YEAR, GRAND_PRIX, SESSION_TYPE
+    YEAR         = int(os.environ.get("F1_YEAR", "2026"))
+    GRAND_PRIX   = os.environ.get("F1_GRAND_PRIX", "Miami Grand Prix")
+    SESSION_TYPE = os.environ.get("F1_SESSION_TYPE", "R")
 LIVE_DATA_FILE = "live_timing_data.txt"
 POLL_INTERVAL  = 5    # seconds — push a full grid snapshot every 5 seconds
 
@@ -76,10 +81,18 @@ POLL_INTERVAL  = 5    # seconds — push a full grid snapshot every 5 seconds
 EVENT_HUB_CONNECTION_STR = os.environ.get("EVENT_HUB_CONNECTION_STRING", "")
 EVENT_HUB_NAME           = os.environ.get("EVENT_HUB_NAME", "")
 
+# ── Inference engine (deferred import — safe if torch not installed) ──────────
+try:
+    from src.live_inference import run_inference_cycle, get_predictions
+    INFERENCE_AVAILABLE = True
+except ImportError:
+    INFERENCE_AVAILABLE = False
+
 # FastF1 cache directory
 cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
 os.makedirs(cache_dir, exist_ok=True)
 fastf1.Cache.enable_cache(cache_dir)
+
 
 # ==============================
 # HELPER — safe value converter
@@ -249,7 +262,7 @@ def push_to_event_hub(data: list[dict], label: str = "laps"):
                 except ValueError:
                     # Batch is full — send current batch, start a new one
                     producer.send_batch(event_data_batch)
-                    log.info(f"Batch full — sent intermediate batch, starting new one.")
+                    log.info("Batch full — sent intermediate batch, starting new one.")
                     event_data_batch = producer.create_batch()
                     event_data_batch.add(EventData(json.dumps(record, default=str)))
 
@@ -260,6 +273,90 @@ def push_to_event_hub(data: list[dict], label: str = "laps"):
 
     except Exception as e:
         log.error(f"Event Hub push failed: {e}", exc_info=True)
+
+
+# ==============================
+# NOTE ON MODEL INFERENCE
+# ==============================
+# Inference is NOT wired in here yet — intentionally.
+#
+# Three things must be confirmed first before it can be added safely:
+#
+# 1. FEATURE COLUMN MISMATCH
+#    The model's feature_cols (saved in each .pt checkpoint) are gold parquet
+#    column names — e.g. "target_driver_number", "gap_to_driver_ahead",
+#    "compound_SOFT", "team_Red Bull Racing" (OHE), etc.
+#    The live snapshot has completely different names: "lap_time_seconds",
+#    "compound", "team". A verified mapping between the two is needed.
+#    Run this to inspect:
+#
+#      import torch
+#      ckpt = torch.load("channel_VER.pt", map_location="cpu", weights_only=False)
+#      print(ckpt["feature_cols"])   # exact list the model expects
+#      print(ckpt["input_size"])     # how many features
+#
+# 2. SEQUENCE RESOLUTION MISMATCH
+#    SEQUENCE_LENGTH = 300 timesteps trained at 0.1s resolution (telemetry).
+#    Live polling runs at 5s intervals (lap-level snapshots).
+#    These are incompatible without a conscious decision about buffer semantics.
+#
+# 3. TORCH DEPLOYMENT SIZE
+#    torch must NOT be imported at module level — only inside inference
+#    functions called at runtime — to keep Azure Functions deployment lean.
+#
+# Once checkpoint feature_cols are confirmed, inference can be added cleanly
+# as a self-contained block between push_to_event_hub and record_live_session,
+# with all imports deferred inside the inference function.
+
+
+# ==============================
+# PROCESS 3: INFERENCE LOOP (Thread 3)
+# ==============================
+INFERENCE_INTERVAL = 90   # seconds — once per lap (~90s average lap time)
+
+def inference_loop():
+    """
+    Runs every INFERENCE_INTERVAL seconds (once per lap).
+    Loads full telemetry + weather, builds feature matrices for all drivers,
+    runs DriverChannel embeddings → RandomForest, writes to _latest_predictions.
+
+    Thread 2 (poll_and_push) reads _latest_predictions via get_predictions()
+    and attaches predicted_position to each Event Hub record.
+
+    This thread is only started if INFERENCE_AVAILABLE is True (torch installed).
+    """
+    if not INFERENCE_AVAILABLE:
+        log.warning("Inference engine not available — Thread 3 will not start.")
+        return
+
+    log.info(f"Inference loop started. First prediction after {INFERENCE_INTERVAL}s warm-up.")
+
+    while True:
+        time.sleep(INFERENCE_INTERVAL)
+        try:
+            data_files = sorted(Path(".").glob("live_timing_data*.txt"))
+            if not data_files:
+                log.info("Inference: no data file yet — waiting.")
+                continue
+
+            file_paths = [str(f) for f in data_files]
+            livedata   = LiveTimingData(*file_paths)
+
+            # Load with telemetry + weather enabled — this is the slow load,
+            # kept in this thread so it never blocks the 5s poll thread.
+            session = fastf1.get_session(YEAR, GRAND_PRIX, SESSION_TYPE)
+            session.load(
+                livedata=livedata,
+                laps=True,
+                telemetry=True,   # needed for feature construction
+                weather=True,     # needed for air_temp, humidity, etc.
+                messages=False,
+            )
+
+            run_inference_cycle(session)   # writes results to _latest_predictions
+
+        except Exception as e:
+            log.error(f"Inference loop error: {e}", exc_info=True)
 
 
 # ==============================
@@ -346,6 +443,18 @@ def poll_and_push():
                 log.info("No lap data available yet — session may not have started.")
                 continue
 
+            # Attach model predictions if available (written by Thread 3)
+            if INFERENCE_AVAILABLE:
+                current_preds = get_predictions()
+                for record in snapshot:
+                    pred = current_preds.get(record.get("driver_code"), {})
+                    record["predicted_position"]    = pred.get("predicted_position")
+                    record["prediction_confidence"] = pred.get("prediction_confidence")
+            else:
+                for record in snapshot:
+                    record["predicted_position"]    = None
+                    record["prediction_confidence"] = None
+
             log.info(f"Pushing snapshot: {len(snapshot)} drivers @ {datetime.utcnow().isoformat()}")
             push_to_event_hub(snapshot, label="live snapshot")
 
@@ -385,6 +494,14 @@ def main():
             "  Check local.settings.json has EVENT_HUB_CONNECTION_STRING filled in."
         )
 
+    # Start inference thread (background) — only if torch is available
+    if INFERENCE_AVAILABLE:
+        inference_thread = threading.Thread(target=inference_loop, daemon=True)
+        inference_thread.start()
+        log.info(f"Inference thread started. Predictions every {INFERENCE_INTERVAL}s.")
+    else:
+        log.warning("Torch not available — running without model predictions.")
+
     # Start polling thread (background)
     poll_thread = threading.Thread(target=poll_and_push, daemon=True)
     poll_thread.start()
@@ -403,6 +520,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ==============================
+# DEAD CODE — previous approach (kept for reference)
+# ==============================
 
 # """
 # F1 Live Qualifying/Race Data Pipeline
@@ -448,8 +570,8 @@ if __name__ == "__main__":
 # # CONFIGURATION
 # # ==============================
 # YEAR         = int(os.environ.get("F1_YEAR", "2026"))
-# GRAND_PRIX   = os.environ.get("F1_GRAND_PRIX", "Japanese Grand Prix")   
-# SESSION_TYPE = os.environ.get("F1_SESSION_TYPE", "R")     
+# GRAND_PRIX   = os.environ.get("F1_GRAND_PRIX", "Japanese Grand Prix")
+# SESSION_TYPE = os.environ.get("F1_SESSION_TYPE", "R")
 
 # LIVE_DATA_FILE = "live_timing_data.txt"
 # POLL_INTERVAL  = 2   # Push updates every 2 seconds for a truly live dashboard
@@ -463,7 +585,7 @@ if __name__ == "__main__":
 # # ==============================
 # def parse_f1_time(time_str):
 #     """Converts F1 time strings (e.g., '1:32.412') to seconds for Power BI."""
-#     if not time_str or not isinstance(time_str, str): 
+#     if not time_str or not isinstance(time_str, str):
 #         return None
 #     try:
 #         if ':' in time_str:
@@ -474,15 +596,13 @@ if __name__ == "__main__":
 #         return None
 
 # class RawTelemetryParser:
-#     """A custom stream processor that extracts lap data directly from the raw SignalR JSON logs."""
 #     def __init__(self):
 #         self.file_positions = {}
-#         self.driver_state = {} # Holds the absolute latest value for every metric
+#         self.driver_state = {}
 
 #     def find_lines_dict(self, payload):
-#         """Recursively hunt for the 'Lines' telemetry block, unpacking stringified JSONs."""
 #         if isinstance(payload, str):
-#             if '"Lines"' in payload:  # F1 hides the real data inside a string
+#             if '"Lines"' in payload:
 #                 try:
 #                     return self.find_lines_dict(json.loads(payload))
 #                 except json.JSONDecodeError:
@@ -501,7 +621,6 @@ if __name__ == "__main__":
 #         return None
 
 #     def extract_value(self, data_dict, key):
-#         """Safely extracts 'Value' from nested F1 telemetry dicts."""
 #         if key in data_dict:
 #             val = data_dict[key]
 #             if isinstance(val, dict):
@@ -512,27 +631,20 @@ if __name__ == "__main__":
 #     def poll(self):
 #         data_files = sorted(Path(".").glob("live_timing_data*.txt"))
 #         lines_processed = 0
-        
-#         # 1. Read all new incoming data and update the running state
 #         for filepath in data_files:
 #             path_str = str(filepath)
 #             if path_str not in self.file_positions:
 #                 self.file_positions[path_str] = 0
-
 #             with open(path_str, 'r', encoding='utf-8') as f:
 #                 f.seek(self.file_positions[path_str])
 #                 for line in f:
 #                     idx = line.find('{')
 #                     if idx == -1: continue
-
 #                     try:
 #                         data = json.loads(line[idx:])
 #                         lines_dict = self.find_lines_dict(data)
 #                         if not lines_dict: continue
-
 #                         lines_processed += 1
-
-#                         # Update the driver's state with the new deltas
 #                         for driver_num, driver_data in lines_dict.items():
 #                             if driver_num not in self.driver_state:
 #                                 self.driver_state[driver_num] = {
@@ -544,20 +656,13 @@ if __name__ == "__main__":
 #                                     "position": None,
 #                                     "gap_to_leader": None
 #                                 }
-                            
 #                             state = self.driver_state[driver_num]
-                            
-#                             # Update fields if they exist in this specific JSON payload
 #                             lap = self.extract_value(driver_data, 'LastLapTime')
 #                             if lap: state["lap_time_seconds"] = parse_f1_time(lap)
-                            
 #                             pos = self.extract_value(driver_data, 'Position')
 #                             if pos: state["position"] = pos
-                            
 #                             gap = self.extract_value(driver_data, 'GapToLeader')
 #                             if gap: state["gap_to_leader"] = gap
-
-#                             # Sectors are inside a list
 #                             if 'Sectors' in driver_data and isinstance(driver_data['Sectors'], list):
 #                                 sectors = driver_data['Sectors']
 #                                 if len(sectors) > 0:
@@ -569,43 +674,33 @@ if __name__ == "__main__":
 #                                 if len(sectors) > 2:
 #                                     s3 = self.extract_value(sectors[2], 'Value')
 #                                     if s3: state["sector3_time_seconds"] = parse_f1_time(s3)
-
 #                     except json.JSONDecodeError:
 #                         pass
-                
-#                 # Save position so we only read new bytes on the next poll
 #                 self.file_positions[path_str] = f.tell()
-
-#         # 2. If we processed new data, yield a snapshot of the ENTIRE grid right now
 #         new_records = []
 #         if lines_processed > 0:
 #             timestamp = datetime.utcnow().isoformat()
 #             for driver_num, state in self.driver_state.items():
-#                 # Create a copy of the state and attach the metadata
 #                 record = state.copy()
 #                 record["timestamp_utc"] = timestamp
 #                 record["year"] = YEAR
 #                 record["grand_prix"] = GRAND_PRIX
 #                 record["session_type"] = SESSION_TYPE
 #                 new_records.append(record)
-                
 #         return new_records
 
 # # ==============================
-# # AZURE EVENT Hub PUSH
+# # AZURE EVENT HUB PUSH
 # # ==============================
 # def push_to_event_hub(data: list[dict], label: str = "laps"):
 #     if not data:
 #         return
-
 #     if not EVENT_HUB_CONNECTION_STR or not EVENT_HUB_NAME:
 #         log.warning("EVENT_HUB_CONNECTION_STRING or EVENT_HUB_NAME not set — dry-run mode.")
 #         return
-
 #     try:
 #         producer = EventHubProducerClient.from_connection_string(
-#             conn_str=EVENT_HUB_CONNECTION_STR,
-#             eventhub_name=EVENT_HUB_NAME
+#             conn_str=EVENT_HUB_CONNECTION_STR, eventhub_name=EVENT_HUB_NAME
 #         )
 #         with producer:
 #             event_data_batch = producer.create_batch()
@@ -616,10 +711,8 @@ if __name__ == "__main__":
 #                     producer.send_batch(event_data_batch)
 #                     event_data_batch = producer.create_batch()
 #                     event_data_batch.add(EventData(json.dumps(record, default=str)))
-
 #             producer.send_batch(event_data_batch)
 #         log.info(f"✅ Pushed {len(data)} {label} records to Azure Event Hub.")
-
 #     except Exception as e:
 #         log.error(f"Event Hub push failed: {e}", exc_info=True)
 
@@ -632,17 +725,11 @@ if __name__ == "__main__":
 #         session_counter += 1
 #         filename = LIVE_DATA_FILE if session_counter == 1 else \
 #             f"live_timing_data_part{session_counter}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
-
 #         log.info(f"Starting SignalRClient -> {filename}")
 #         try:
-#             client = SignalRClient(
-#                 filename=filename,
-#                 filemode="w",
-#                 timeout=300,
-#                 debug=False,
-#                 no_auth=False 
-#             )
-#             client.start()    
+#             client = SignalRClient(filename=filename, filemode="w", timeout=300,
+#                                    debug=False, no_auth=False)
+#             client.start()
 #             log.info("SignalRClient stopped — session likely ended.")
 #             break
 #         except KeyboardInterrupt:
@@ -658,13 +745,12 @@ if __name__ == "__main__":
 # def poll_and_push():
 #     log.info("Raw telemetry polling loop started. Waiting for data...")
 #     parser = RawTelemetryParser()
-
 #     while True:
 #         time.sleep(POLL_INTERVAL)
 #         try:
 #             new_lap_records = parser.poll()
 #             if new_lap_records:
-#                 log.info(f"Parsed and pushing snapshot of {len(new_lap_records)} drivers directly from stream.")
+#                 log.info(f"Pushing {len(new_lap_records)} drivers from stream.")
 #                 push_to_event_hub(new_lap_records, label="live snapshot")
 #         except Exception as e:
 #             log.error(f"Poll error: {e}", exc_info=True)
@@ -677,12 +763,9 @@ if __name__ == "__main__":
 #     log.info("F1 Real-Time Telemetry Stream — Azure Edition")
 #     log.info(f"Event Hub configured: {'YES' if EVENT_HUB_CONNECTION_STR else 'NO'}")
 #     log.info("=" * 60)
-
 #     poll_thread = threading.Thread(target=poll_and_push, daemon=True)
 #     poll_thread.start()
-
 #     record_live_session()
-
 #     log.info("Recording done. Running final poll...")
 #     time.sleep(POLL_INTERVAL + 2)
 #     log.info("Pipeline complete.")
