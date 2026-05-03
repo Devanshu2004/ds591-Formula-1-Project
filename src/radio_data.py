@@ -570,44 +570,42 @@ def _get_openf1_token() -> str:
     return _token_cache["token"]
 
 
+def _mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes | None:
+    """Convert MP3 bytes → 16kHz mono PCM WAV bytes using miniaudio (no system deps)."""
+    import io
+    import wave
+    try:
+        import miniaudio
+        decoded = miniaudio.decode(
+            mp3_bytes,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=16000,
+        )
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(bytes(decoded.samples))
+        return buf.getvalue()
+    except Exception as e:
+        log.warning("miniaudio conversion failed: %s", e)
+        return None
+
+
 def _transcribe_azure_speech(audio_bytes: bytes) -> str | None:
     """
     Transcribe MP3 bytes via Azure Speech REST API.
     Converts MP3 → WAV (16kHz mono PCM) first — Azure Speech REST requires WAV.
     Returns transcript text or None.
     """
-    import subprocess
-    import tempfile
-
     speech_key    = os.getenv("AZURE_SPEECH_KEY", "")
     speech_region = os.getenv("AZURE_SPEECH_REGION", "")
 
-    # Resolve ffmpeg: use bundled Linux binary on Azure, system ffmpeg locally
-    _here   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    _linux  = os.path.join(_here, "bin", "ffmpeg_linux")
-    ffmpeg  = _linux if os.path.isfile(_linux) else "ffmpeg"
-
-    # Convert MP3 → WAV via ffmpeg
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        mp3_path = tmp.name
-    wav_path = mp3_path.replace(".mp3", ".wav")
-    try:
-        subprocess.run(
-            [ffmpeg, "-y", "-i", mp3_path,
-             "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", wav_path],
-            capture_output=True, check=True,
-        )
-        wav_bytes = open(wav_path, "rb").read()
-    except Exception as e:
-        log.warning("ffmpeg conversion failed: %s", e)
+    wav_bytes = _mp3_to_wav_bytes(audio_bytes)
+    if wav_bytes is None:
         return None
-    finally:
-        for p in (mp3_path, wav_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
 
     resp = requests.post(
         f"https://{speech_region}.stt.speech.microsoft.com"
