@@ -15,3 +15,4 @@ textblob
 scikit-learn 
 torch
 openai-whisper
+paho-mqtt
