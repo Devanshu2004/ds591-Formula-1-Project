@@ -235,9 +235,9 @@ def classify_radio(transcript, record):
         severity = "moderate"
     elif hits["mech"]:
         for kw, it in [("engine", "engine"), ("power unit", "engine"), ("brake", "brakes"),
-                       ("gearbox", "gearbox"), ("battery", "battery"), ("ers", "battery"),
-                       ("overheat", "overheating"), ("temperature", "overheating"),
-                       ("steering", "steering")]:
+                        ("gearbox", "gearbox"), ("battery", "battery"), ("ers", "battery"),
+                        ("overheat", "overheating"), ("temperature", "overheating"),
+                        ("steering", "steering")]:
             if kw in text_lower:
                 issue_type = it
                 break
@@ -436,8 +436,8 @@ def run_radio_silver(session_key=None):
     """
     Read radio_transcripts.json from ADLS bronze (pre-transcribed by Whisper on SCC/Colab),
     classify each transcript, and write to ADLS silver:
-      - silver/radio.parquet   flat file, one row per transcript
-                               includes GP name + radio_session_time (seconds since race start)
+        - silver/radio.parquet   flat file, one row per transcript
+                                includes GP name + radio_session_time (seconds since race start)
 
     Returns nested JSON:
         { "Status": "Success", "Year": { year: { driver_abb: { event_type: count } } } }
@@ -595,7 +595,7 @@ def _transcribe_azure_speech(audio_bytes: bytes) -> str | None:
     try:
         subprocess.run(
             [ffmpeg, "-y", "-i", mp3_path,
-             "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", wav_path],
+            "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", wav_path],
             capture_output=True, check=True,
         )
         wav_bytes = open(wav_path, "rb").read()
@@ -633,14 +633,14 @@ def run_radio_live(poll_interval: int = 0) -> None:
     Called by the Azure Timer Trigger every 15 seconds during a race.
 
     Each firing:
-      1. Gets a valid OpenF1 token (refreshes automatically when near expiry)
-      2. Opens an MQTT connection to OpenF1, subscribes to v1/team_radio only
-      3. Listens for 13 seconds, collecting incoming radio payloads
-      4. Disconnects, then for each new recording:
-           - Downloads the MP3
-           - Transcribes via Azure Speech Services
-           - Classifies + enriches to match silver/radio.parquet schema
-      5. Appends new rows to silver/radio_live.parquet on ADLS
+        1. Gets a valid OpenF1 token (refreshes automatically when near expiry)
+        2. Opens an MQTT connection to OpenF1, subscribes to v1/team_radio only
+        3. Listens for 13 seconds, collecting incoming radio payloads
+        4. Disconnects, then for each new recording:
+            - Downloads the MP3
+            - Transcribes via Azure Speech Services
+            - Classifies + enriches to match silver/radio.parquet schema
+        5. Appends new rows to silver/radio_live.parquet on ADLS
 
     Output schema matches silver/radio.parquet so live data can be merged
     with historical data after the race.
@@ -769,7 +769,7 @@ def run_radio_live(poll_interval: int = 0) -> None:
 
         new_events.append(event)
         log.info("Classified: driver=%s  primary=%s  transcript=%s",
-                 event.get("driver_abb"), event.get("primary_event_type"), transcript[:60])
+                event.get("driver_abb"), event.get("primary_event_type"), transcript[:60])
 
     if not new_events:
         return
@@ -787,7 +787,7 @@ def run_radio_live(poll_interval: int = 0) -> None:
         pq.write_table(table, fh)
 
     log.info("Appended %d events → silver/radio_live.parquet (%d total)",
-             len(new_events), len(combined))
+            len(new_events), len(combined))
 
 
 if __name__ == "__main__":

@@ -1,31 +1,27 @@
 {
   "IsEncrypted": false,
   "Values": {
-    "AzureWebJobsStorage": "",
-
-    "STORAGE_ACCOUNT_NAME": "",
-    "STORAGE_ACCOUNT_KEY": "",
-    "BRONZE_CONTAINER": "bronze",
-    "SILVER_CONTAINER": "silver",
-
-    "ADLS_CONTAINER": "",
-    "ADLS_DIRECTORY": "",
-
-    "EVENT_HUB_CONNECTION_STRING": "",
-    "EVENT_HUB_NAME": "",
-
-    "AZURE_SPEECH_KEY": "",
-    "AZURE_SPEECH_REGION": "",
-
-    "OPENF1_EMAIL": "",
-    "OPENF1_PASSWORD": "",
-
-    "F1_USERNAME": "",
-    "F1_PASSWORD": "",
+    "AzureWebJobsStorage": ,
+    "STORAGE_ACCOUNT_NAME": ,
+    "STORAGE_ACCOUNT_KEY": ,
+    "ADLS_CONTAINER": ,
+    "ADLS_DIRECTORY": ,
+    "BRONZE_CONTAINER": ,
+    "SILVER_CONTAINER": ,
+    "GOLD_CONTAINER": ,
+    "EVENT_HUB_CONNECTION_STRING": ,
+    "EVENT_HUB_NAME": ,
+    "F1_USERNAME": ,
+    "F1_PASSWORD": ,
+    "AZURE_SPEECH_KEY": ,
+    "AZURE_SPEECH_REGION": ,
+    "OPENF1_EMAIL": ,
+    "OPENF1_PASSWORD": ,
     "F1_YEAR": "2026",
     "F1_GRAND_PRIX": "Miami",
     "F1_SESSION_TYPE": "R",
-
     "FUNCTIONS_WORKER_RUNTIME": "python"
-  }
+  },
+  "ConnectionStrings": {},
+  "Host": {}
 }

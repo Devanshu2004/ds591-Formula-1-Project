@@ -1,57 +1,9 @@
-'''
-import azure.functions as func
-import logging
-import os
-# Import your existing logic from the src folder
-from src.telemetry_analysis import your_main_analysis_function 
-
-app = func.FunctionApp()
-
-# This decorator defines the Timer Trigger (Running every hour)
-@app.timer_trigger(schedule="0 0 * * * *", arg_name="mytimer", run_on_startup=False)
-def f1_live_process(mytimer: func.TimerRequest) -> None:
-    if mytimer.past_due:
-        logging.info('The timer is past due!') [cite: 125]
-
-    logging.info("Starting F1 Live Telemetry Process...")
-    
-    try:
-        # Call your existing analytics code here
-        # Example: passing a specific GP or year
-        result = your_main_analysis_function(year=2024, gp='Monaco')
-        logging.info(f"Analysis Complete: {result}")
-        
-    except Exception as e:
-        logging.error(f"Error during F1 Process: {e}")
-'''
-
 import azure.functions as func
 import logging
 import json
 import os 
-# from src.live_casting import main as live_casting_main
-# from src.social_media_analysis import run_social_processor
 
 app = func.FunctionApp()
-
-
-# This decorator defines the Timer Trigger (Running every hour)
-# @app.timer_trigger(schedule="*/10 * * * * *", arg_name="mytimer", run_on_startup=False)
-# def f1_live_process(mytimer: func.TimerRequest) -> None:
-#     from src.live_casting import main as live_casting_main
-#     if mytimer.past_due:
-#         logging.info('The timer is past due!')
-
-#     logging.info("Starting F1 Live Telemetry Process...")
-    
-#     try:
-#         # Call your existing analytics code here
-#         # Example: passing a specific GP or year
-#         result = live_casting_main()
-#         logging.info(f"Analysis Complete: {result}")
-        
-#     except Exception as e:
-#         logging.error(f"Error during F1 Process: {e}")
 
 def get_env(name: str, default: str = None, required: bool = False) -> str:
     """
@@ -72,44 +24,6 @@ def json_response(payload: dict, status_code: int = 200) -> func.HttpResponse:
     )
 
 
-# ── LIVE TELEMETRY: EVENT HUB TRIGGER ──────────────────────────────────────────
-# @app.event_hub_message_trigger(
-#     arg_name="event",
-#     event_hub_name="%EVENT_HUB_NAME%",
-#     connection="EVENT_HUB_CONNECTION_STRING"
-# )
-# def f1_live_ingest(event: func.EventHubEvent):
-#     """
-#     Triggered automatically whenever a message arrives on the Event Hub.
-#     Writes raw telemetry to ADLS bronze/live layer.
-#     """
-#     logging.info("Event Hub trigger fired — new F1 telemetry received")
-
-#     try:
-#         raw = event.get_body().decode("utf-8")
-#         logging.info(f"Raw event received, length={len(raw)}")
-
-#         storage_account = get_env("STORAGE_ACCOUNT_NAME", required=True)
-#         storage_key = get_env("STORAGE_ACCOUNT_KEY", required=True)
-#         container = get_env("ADLS_CONTAINER", required=True)
-#         directory = get_env("ADLS_DIRECTORY", required=True)
-
-#         from src.fetch_data import store_bronze
-#         store_bronze(
-#             raw_data=raw,
-#             storage_account=storage_account,
-#             storage_key=storage_key,
-#             container=container,
-#             directory=directory
-#         )
-
-#         logging.info("Bronze layer write successful")
-
-#     except Exception as e:
-#         logging.exception(f"Live ingest failed: {e}")
-#         raise
-
-
 # ── LIVE TRANSMISSION: HTTP TRIGGER ────────────────────────────────────────────
 @app.route(route="run_live", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def run_live(req: func.HttpRequest) -> func.HttpResponse:
@@ -120,9 +34,9 @@ def run_live(req: func.HttpRequest) -> func.HttpResponse:
     POST /api/run_live
     Optional JSON body:
     {
-      "year":         "2026",
-      "gp":           "Japanese Grand Prix",
-      "session_type": "R"
+        "year":         "2026",
+        "gp":           "Japanese Grand Prix",
+        "session_type": "R"
     }
 
     NOTE: This call blocks for the full duration of the session (up to ~2 hrs for a race).
@@ -268,7 +182,7 @@ def run_radio_bronze(req: func.HttpRequest) -> func.HttpResponse:
 
     Optional JSON body:
     {
-      "session_key": 9158
+        "session_key": 9158
     }
     """
     logging.info("Radio bronze pipeline triggered")
@@ -305,8 +219,8 @@ def run_radio_silver(req: func.HttpRequest) -> func.HttpResponse:
 
     Optional JSON body:
     {
-      "session_key": 9158,
-      "whisper_model": "base"
+        "session_key": 9158,
+        "whisper_model": "base"
     }
     """
     logging.info("Radio silver pipeline triggered")
@@ -378,11 +292,11 @@ def run_model(req: func.HttpRequest) -> func.HttpResponse:
 
     Pipeline order:
         run_radio_bronze
-               ↓
+                ↓
         run_silver | run_radio_silver | process_social  (parallel)
-               ↓
+                ↓
             run_gold
-               ↓
+                ↓
             run_model  ← this function
 
     What it does:
