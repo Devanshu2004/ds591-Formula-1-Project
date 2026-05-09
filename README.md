@@ -8,7 +8,7 @@ A full-stack Formula 1 analytics platform that combines historical race telemetr
 
 ## Architecture Overview
 
-<!-- Add architecture diagram here -->
+![Architecture Diagram](assets/architecture.png)
 
 The platform is built on Azure and follows a **Medallion architecture** (Bronze → Silver → Gold → Platinum) with four parallel data pipelines feeding a single predictive model.
 
